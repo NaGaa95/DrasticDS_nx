@@ -38,7 +38,7 @@ renderer and bundled application resources on demand:
   cache/
   cheats/                 <- custom Action Replay files
   cores/                  <- Drastic ARM64 core, auto-extracted
-  covers/                 <- manual cover art (<GameID>-<Checksum>.png or <ROM-Name>.png)
+  covers/                 <- manual cover art (<GameID>-<Checksum>.png)
   forwarders/             <- HOME-menu shortcut working data
   gamecfg/                <- per-game launcher settings
   games/                  <- default ROM library
