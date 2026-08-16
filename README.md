@@ -38,7 +38,7 @@ renderer and bundled application resources on demand:
   cache/
   cheats/                 <- custom Action Replay files
   cores/                  <- Drastic ARM64 core, auto-extracted
-  covers/                 <- cover art (<game-key>.png)
+  covers/                 <- manual cover art (<GameID>-<Checksum>.png or <ROM-Name>.png)
   forwarders/             <- HOME-menu shortcut working data
   gamecfg/                <- per-game launcher settings
   games/                  <- default ROM library
@@ -100,6 +100,14 @@ For GBA Cart, put the GBA ROM and its raw cartridge save in
 `Pokemon Platinum.nds`). `slot2_gamepak.gba` and `slot2_gamepak.sav` can be
 used as the shared fallback pair. The DS and GBA releases still need to be
 region-compatible, and only games with Slot-2 connectivity can use them.
+
+### Cover art
+
+Covers can be downloaded automatically in the launcher via SteamGridDB (press the options button on a game).
+
+For manual offline covers, place a `.png` file inside `/switch/drastic/covers/`:
+* Drastic identifies ROMs internally as `<GameCode>-<ROM-Hash>.png` (for example, `IPGE-2b24f8a6e7d79c90.png`).
+* To easily find this key, launch the game once; the exact key is the filename generated in `/switch/drastic/gamecfg/` (`IPGE-2b24f8a6e7d79c90.cfg` for example).
 
 ### Notes
 
