@@ -906,11 +906,18 @@ static void commitAll() {
 
 static SDL_Window   *g_win = nullptr;
 static SDL_Renderer *g_ren = nullptr;
-static TTF_Font     *g_font = nullptr, *g_font_sm = nullptr, *g_font_big = nullptr;
+static TTF_Font     *g_font = nullptr, *g_font_sm = nullptr, *g_font_big = nullptr,
+                    *g_font_caption = nullptr;
 static PlSharedFontType g_uiFontType = PlSharedFontType_Total;
 static SDL_Texture  *g_logo = nullptr;
 static int SW = 1280, SH = 720;
 static int g_outputW = 1280, g_outputH = 720;
+// Layout is always expressed in a fixed 1280x720 logical space; SDL scales it
+// up to the real output.  g_fontScale is the scale the currently loaded fonts
+// were opened at, which can lag g_uiScale until reloadUiFonts() runs again.
+static float g_uiScale = 1.0f;
+static float g_fontScale = 1.0f;
+static bool g_presentVsync = false;
 static int g_launcherRotation = 0;
 static bool g_launcherPortrait = false;
 static SDL_Texture *g_uiTarget = nullptr;
@@ -933,51 +940,32 @@ static void drawPendingToast();
 static bool configureLauncherOrientation(int rotation) {
   if(!g_ren || g_outputW<1 || g_outputH<1) return false;
   if(rotation<0||rotation>3) rotation=0;
-  if(rotation==0){
-    SDL_SetRenderTarget(g_ren,nullptr);
-    if(g_uiTarget) SDL_DestroyTexture(g_uiTarget);
-    g_uiTarget=nullptr;
-    g_launcherRotation=0;
-    g_launcherPortrait=false;
-    SW=g_outputW;
-    SH=g_outputH;
-    SDL_RenderSetViewport(g_ren,nullptr);
-    SDL_RenderSetScale(g_ren,1.0f,1.0f);
-    return true;
-  }
   const bool portrait=(rotation&1)!=0;
-  const int logicalWidth=portrait?g_outputH:g_outputW;
-  const int logicalHeight=portrait?g_outputW:g_outputH;
-  if(g_uiTarget && SW==logicalWidth && SH==logicalHeight) {
-    g_launcherRotation=rotation;
-    g_launcherPortrait=portrait;
-    SDL_SetRenderTarget(g_ren,g_uiTarget);
-    return true;
+  const int targetWidth=portrait?g_outputH:g_outputW;
+  const int targetHeight=portrait?g_outputW:g_outputH;
+  SDL_Texture *target=nullptr;
+  if(rotation){
+    int width=0,height=0;
+    if(g_uiTarget) SDL_QueryTexture(g_uiTarget,nullptr,nullptr,&width,&height);
+    target=width==targetWidth&&height==targetHeight?g_uiTarget:
+      SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,
+                        targetWidth,targetHeight);
+    if(!target) return false;
+    SDL_SetTextureBlendMode(target,SDL_BLENDMODE_NONE);
   }
-
-  SDL_Texture *previous=g_uiTarget;
-  SDL_SetRenderTarget(g_ren,nullptr);
-  SDL_Texture *target=SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_RGBA8888,
-                                        SDL_TEXTUREACCESS_TARGET,
-                                        logicalWidth,logicalHeight);
-  if(!target){
-    if(previous) SDL_SetRenderTarget(g_ren,previous);
-    return false;
-  }
-  SDL_SetTextureBlendMode(target,SDL_BLENDMODE_NONE);
   if(SDL_SetRenderTarget(g_ren,target)!=0){
-    SDL_DestroyTexture(target);
-    if(previous) SDL_SetRenderTarget(g_ren,previous);
+    if(target&&target!=g_uiTarget) SDL_DestroyTexture(target);
     return false;
   }
+  if(g_uiTarget&&g_uiTarget!=target) SDL_DestroyTexture(g_uiTarget);
   g_uiTarget=target;
   g_launcherRotation=rotation;
   g_launcherPortrait=portrait;
-  SW=logicalWidth;
-  SH=logicalHeight;
-  if(previous) SDL_DestroyTexture(previous);
+  SW=portrait?720:1280;
+  SH=portrait?1280:720;
+  g_uiScale=std::min(g_outputW/1280.0f,g_outputH/720.0f);
   SDL_RenderSetViewport(g_ren,nullptr);
-  SDL_RenderSetScale(g_ren,1.0f,1.0f);
+  SDL_RenderSetScale(g_ren,g_uiScale,g_uiScale);
   return true;
 }
 
@@ -989,6 +977,7 @@ static void presentUi() {
   }
   SDL_RenderSetClipRect(g_ren,nullptr);
   SDL_SetRenderTarget(g_ren,nullptr);
+  SDL_RenderSetScale(g_ren,1.0f,1.0f);
   SDL_SetRenderDrawColor(g_ren,0,0,0,255);
   SDL_RenderClear(g_ren);
   /* Odd quarter-turns use a portrait render target. RenderCopyEx rotates its
@@ -1003,6 +992,7 @@ static void presentUi() {
                    SDL_FLIP_NONE);
   SDL_RenderPresent(g_ren);
   SDL_SetRenderTarget(g_ren,g_uiTarget);
+  SDL_RenderSetScale(g_ren,g_uiScale,g_uiScale);
 }
 
 enum class LauncherTheme { Xmb, Glow, Bubbles, Classic, Oled };
@@ -1014,6 +1004,11 @@ static bool g_showCustomSettingsBadges = true;
 static int g_gridColumns = 6;
 static int g_gridRows = 2;
 static SDL_Texture *g_glowTexture = nullptr;
+static SDL_Texture *g_roundTexture = nullptr;
+// Number of footer hints recorded this frame.  clearUiBackground() resets it,
+// so it has to live next to the other UI globals rather than inside the footer
+// block further down.
+static int g_footN = 0;
 
 static SDL_Color COL_BG    = { 8, 12, 24, 255 };
 static SDL_Color COL_TXT   = { 235, 239, 247, 255 };
@@ -1021,12 +1016,29 @@ static SDL_Color COL_DIM   = { 151, 163, 184, 255 };
 static SDL_Color COL_HI    = { 100, 211, 255, 255 };
 static SDL_Color COL_VAL   = { 255, 215, 120, 255 };
 static SDL_Color COL_SEL   = { 116, 200, 255, 255 };
-static SDL_Color COL_PANEL = { 16, 23, 39, 184 };
+static SDL_Color COL_PANEL = { 16, 23, 39, 255 };
 static SDL_Color COL_CARD  = { 22, 30, 49, 214 };
-static SDL_Color COL_FOCUS = { 28, 69, 92, 210 };
+static SDL_Color COL_FOCUS = { 28, 69, 92, 255 };
 
-static void fillRect(int x,int y,int w,int h, SDL_Color c){ SDL_SetRenderDrawColor(g_ren,c.r,c.g,c.b,c.a); SDL_Rect r={x,y,w,h}; SDL_RenderFillRect(g_ren,&r); }
+// Logical coordinates land on fractional output pixels once the renderer is
+// scaled.  Snapping both edges keeps hairlines a consistent width and stops
+// seams appearing between adjacent fills.
+static SDL_FRect pixelAlignedRect(int x,int y,int w,int h){
+  float sx=1,sy=1;SDL_RenderGetScale(g_ren,&sx,&sy);
+  const float left=std::round(x*sx),top=std::round(y*sy);
+  return {left/sx,top/sy,(std::round((x+w)*sx)-left)/sx,(std::round((y+h)*sy)-top)/sy};
+}
+static void fillRect(int x,int y,int w,int h, SDL_Color c){
+  if(w<=0||h<=0) return;
+  const SDL_FRect rect=pixelAlignedRect(x,y,w,h);
+  SDL_SetRenderDrawColor(g_ren,c.r,c.g,c.b,c.a);
+  SDL_RenderFillRectF(g_ren,&rect);
+}
 static void border(int x,int y,int w,int h,int t, SDL_Color c){ SDL_SetRenderDrawColor(g_ren,c.r,c.g,c.b,c.a); for(int i=0;i<t;i++){ SDL_Rect r={x-i,y-i,w+2*i,h+2*i}; SDL_RenderDrawRect(g_ren,&r); } }
+
+// Layout uses 720p coordinates; text textures retain the output resolution.
+static int fontMetric(int pixels){ return (int)std::ceil(pixels/g_fontScale); }
+static int fontHeight(TTF_Font *font){ return font?fontMetric(TTF_FontHeight(font)):0; }
 
 struct TextKey {
   TTF_Font *font;
@@ -1048,8 +1060,8 @@ struct TextKeyHash {
 
 struct TextEntry {
   SDL_Texture *texture;
-  int width;
-  int height;
+  float width;
+  float height;
   size_t bytes;
   Uint64 use;
 };
@@ -1157,25 +1169,25 @@ static void applyLauncherAppearance() {
   g_gridRows = std::max(1, std::min(3, atoi(storeGet(g_global, "Wrapper/GridRows", "2"))));
 
   if (g_launcherTheme == LauncherTheme::Xmb) {
-    COL_BG={2,35,92,255}; COL_TXT={246,250,255,255}; COL_DIM={176,207,233,255};
-    COL_HI={151,229,255,255}; COL_VAL={255,255,255,255}; COL_SEL={116,218,255,255};
-    COL_PANEL={4,28,73,164}; COL_CARD={5,36,86,196}; COL_FOCUS={20,91,148,214};
+    COL_BG={8,51,104,255}; COL_TXT={242,247,255,255}; COL_DIM={180,204,227,255};
+    COL_HI={137,225,255,255}; COL_VAL={245,252,255,255}; COL_SEL={118,213,255,255};
+    COL_PANEL={10,43,81,255}; COL_CARD={12,48,85,255}; COL_FOCUS={22,75,119,255};
   } else if (g_launcherTheme == LauncherTheme::Classic) {
     COL_BG={22,24,30,255}; COL_TXT={228,230,235,255}; COL_DIM={150,155,165,255};
     COL_HI={96,200,255,255}; COL_VAL={255,210,100,255}; COL_SEL={255,170,0,255};
-    COL_PANEL={28,31,40,255}; COL_CARD={24,26,34,255}; COL_FOCUS={66,56,30,235};
+    COL_PANEL={28,31,40,255}; COL_CARD={24,26,34,255}; COL_FOCUS={66,56,30,255};
   } else if (g_launcherTheme == LauncherTheme::Oled) {
     COL_BG={0,0,0,255}; COL_TXT={245,247,249,255}; COL_DIM={145,151,158,255};
     COL_HI={105,220,255,255}; COL_VAL={255,255,255,255}; COL_SEL={0,210,190,255};
-    COL_PANEL={4,4,5,248}; COL_CARD={8,8,10,250}; COL_FOCUS={0,58,53,245};
+    COL_PANEL={4,4,5,255}; COL_CARD={8,8,10,250}; COL_FOCUS={0,58,53,255};
   } else if (g_launcherTheme == LauncherTheme::Bubbles) {
     COL_BG={0,8,16,255}; COL_TXT={235,248,255,255}; COL_DIM={143,192,216,255};
     COL_HI={118,222,255,255}; COL_VAL={194,239,255,255}; COL_SEL={61,183,235,255};
-    COL_PANEL={4,31,50,190}; COL_CARD={5,35,56,218}; COL_FOCUS={12,76,108,220};
+    COL_PANEL={4,31,50,255}; COL_CARD={5,35,56,218}; COL_FOCUS={12,76,108,255};
   } else {
     COL_BG={8,12,24,255}; COL_TXT={235,239,247,255}; COL_DIM={151,163,184,255};
     COL_HI={100,211,255,255}; COL_VAL={255,215,120,255}; COL_SEL={116,200,255,255};
-    COL_PANEL={16,23,39,184}; COL_CARD={22,30,49,214}; COL_FOCUS={28,69,92,208};
+    COL_PANEL={16,23,39,255}; COL_CARD={22,30,49,214}; COL_FOCUS={28,69,92,255};
   }
   if (previous != g_launcherTheme && g_ren)
     clearTextCaches();
@@ -1240,15 +1252,16 @@ static float xmbWaveY(float x,float time,float center,float amplitude,float freq
 static void drawXmbRibbon(float time,float center,float amplitude,float frequency,float slope,float phase,
                           int halfWidth,SDL_Color color) {
   constexpr int pointCount=121;
-  std::array<SDL_Point,pointCount> points{};
+  std::array<SDL_Point,pointCount> base{},points{};
+  for(int point=0;point<pointCount;point++){
+    const float x=(float)point/(pointCount-1);
+    base[point]={(int)(x*SW),(int)(xmbWaveY(x,time,center,amplitude,frequency,slope,phase)*SH)};
+  }
   for(int offset=-halfWidth;offset<=halfWidth;offset++){
     float distance=halfWidth?fabsf((float)offset/halfWidth):0.f;
     Uint8 alpha=(Uint8)(color.a*powf(std::max(0.f,1.f-distance),1.45f));
     if(alpha<2) continue;
-    for(int point=0;point<pointCount;point++){
-      float x=(float)point/(pointCount-1);
-      points[point]={(int)(x*SW),(int)(xmbWaveY(x,time,center,amplitude,frequency,slope,phase)*SH)+offset};
-    }
+    for(int point=0;point<pointCount;point++) points[point]={base[point].x,base[point].y+offset};
     SDL_SetRenderDrawColor(g_ren,color.r,color.g,color.b,alpha);
     SDL_RenderDrawLines(g_ren,points.data(),pointCount);
   }
@@ -1284,7 +1297,7 @@ static void drawXmbSparkles(float time) {
 }
 
 static void drawXmbBackground(float time) {
-  const SDL_Color top={3,37,102,255},middle={8,93,184,255},bottom={0,20,68,255};
+  const SDL_Color top={8,51,104,255},middle={12,82,139,255},bottom={6,39,82,255};
   constexpr int bands=72;
   for(int band=0;band<bands;band++){
     float y=(band+0.5f)/bands;
@@ -1300,12 +1313,12 @@ static void drawXmbBackground(float time) {
     fillRect(0,y0,SW,y1-y0,color);
   }
   if(g_glowTexture){
-    drawGlow(0.10f,0.43f,1.18f,55,157,255,54);
-    drawGlow(0.84f,0.38f,0.92f,41,112,228,42);
+    drawGlow(0.10f,0.43f,1.18f,55,157,255,32);
+    drawGlow(0.84f,0.38f,0.92f,41,112,228,24);
   }
   drawXmbRibbon(time,0.655f,0.082f,0.78f,-0.105f,2.15f,std::max(12,SH/18),(SDL_Color){63,166,255,31});
-  drawXmbRibbon(time,0.575f,0.074f,0.96f,0.080f,0.35f,std::max(10,SH/25),(SDL_Color){189,235,255,48});
-  drawXmbRibbon(time,0.605f,0.049f,1.28f,-0.025f,3.82f,std::max(5,SH/54),(SDL_Color){230,250,255,72});
+  drawXmbRibbon(time,0.575f,0.074f,0.96f,0.080f,0.35f,std::max(10,SH/25),(SDL_Color){189,235,255,26});
+  drawXmbRibbon(time,0.605f,0.049f,1.28f,-0.025f,3.82f,std::max(5,SH/54),(SDL_Color){230,250,255,36});
   for(int trace=0;trace<9;trace++){
     float offset=(trace-4)*0.009f;
     drawXmbFilament(time,0.588f+offset,0.083f+trace*0.0017f,0.91f,0.052f,
@@ -1387,7 +1400,28 @@ static void drawBubblesBackground(float time) {
   drawBackgroundParticles(time,(SDL_Color){164,228,255,62},24,0.008f);
 }
 
+// Per-position marquee state.  Each scrolling run restarts when its text
+// changes and rests 0.9 s at either end, so a stationary label is readable.
+struct TextScroll { std::string text; Uint32 since=0; };
+static std::map<std::pair<int,int>,TextScroll> g_textScroll;
+static bool g_scrollTextActive=false;
+static int textScrollOffset(int x,int y,int span,const char *text){
+  g_scrollTextActive=true;
+  if(g_textScroll.size()>64)g_textScroll.clear();
+  auto &scroll=g_textScroll[{x,y}];
+  const Uint32 now=SDL_GetTicks();
+  if(scroll.text!=text){scroll.text=text;scroll.since=now;}
+  const float travel=span/45.0f,pause=0.9f;
+  const float phase=std::fmod((now-scroll.since)/1000.0f,2*(travel+pause));
+  if(phase<pause)return 0;
+  if(phase<pause+travel)return (int)((phase-pause)*45);
+  if(phase<2*pause+travel)return span;
+  return std::max(0,span-(int)((phase-2*pause-travel)*45));
+}
+
 static void clearUiBackground() {
+  g_scrollTextActive=false;
+  g_footN=0;
   SDL_RenderSetClipRect(g_ren,nullptr);
   SDL_SetRenderDrawColor(g_ren,COL_BG.r,COL_BG.g,COL_BG.b,255);
   SDL_RenderClear(g_ren);
@@ -1414,10 +1448,69 @@ static void clearUiBackground() {
   SDL_SetTextureAlphaMod(g_glowTexture,255);
 }
 
-static void glassPanel(int x,int y,int width,int height) {
-  fillRect(x,y,width,height,COL_PANEL);
-  border(x,y,width,height,1,(SDL_Color){255,255,255,(Uint8)(hasAnimatedBackground()?28:16)});
+// One antialiased disc, sliced into four corners, plus plain fills for the
+// middle.  Created lazily and destroyed in cleanupLauncher().
+static void roundedRect(int x,int y,int width,int height,int radius,SDL_Color color){
+  if(width<=0||height<=0)return;
+  const int r=std::min({radius,width/2,height/2});
+  if(!g_roundTexture){
+    SDL_Surface *surface=SDL_CreateRGBSurfaceWithFormat(0,32,32,32,SDL_PIXELFORMAT_RGBA32);
+    if(surface){
+      for(int py=0;py<32;py++){
+        auto *row=(Uint32*)((Uint8*)surface->pixels+py*surface->pitch);
+        for(int px=0;px<32;px++){
+          const float dx=px-15.5f,dy=py-15.5f;
+          const Uint8 alpha=(Uint8)(255*std::clamp(16.f-std::sqrt(dx*dx+dy*dy),0.f,1.f));
+          row[px]=SDL_MapRGBA(surface->format,255,255,255,alpha);
+        }
+      }
+      g_roundTexture=SDL_CreateTextureFromSurface(g_ren,surface);SDL_FreeSurface(surface);
+      if(g_roundTexture)SDL_SetTextureBlendMode(g_roundTexture,SDL_BLENDMODE_BLEND);
+    }
+  }
+  if(!g_roundTexture||r<1){fillRect(x,y,width,height,color);return;}
+  fillRect(x+r,y,width-r*2,height,color);
+  fillRect(x,y+r,r,height-r*2,color);fillRect(x+width-r,y+r,r,height-r*2,color);
+  SDL_SetTextureColorMod(g_roundTexture,color.r,color.g,color.b);
+  SDL_SetTextureAlphaMod(g_roundTexture,color.a);
+  for(int corner=0;corner<4;corner++){
+    const SDL_Rect source={(corner&1)*16,(corner>>1)*16,16,16};
+    const SDL_FRect destination=pixelAlignedRect(x+((corner&1)?width-r:0),
+                                                 y+((corner>>1)?height-r:0),r,r);
+    SDL_RenderCopyF(g_ren,g_roundTexture,&source,&destination);
+  }
 }
+
+// A rounded panel is an edge ring with a face inset by `thickness`; every panel,
+// button and checkbox in the launcher is built from this so they share a shape.
+static void roundedPanel(int x,int y,int width,int height,SDL_Color face,SDL_Color edge,
+                         int radius=8,int thickness=1){
+  roundedRect(x,y,width,height,radius,edge);
+  roundedRect(x+thickness,y+thickness,width-2*thickness,height-2*thickness,
+              std::max(0,radius-thickness),face);
+}
+static void glassPanel(int x,int y,int width,int height) {
+  roundedPanel(x,y,width,height,COL_PANEL,(SDL_Color){255,255,255,24});
+}
+static void drawButtonPanel(int x,int y,int width,int height,bool selected){
+  roundedPanel(x,y,width,height,selected?COL_FOCUS:COL_CARD,
+               selected?COL_SEL:SDL_Color{255,255,255,28},6);
+}
+// Fully rounded pill; clamps its own fraction so callers never have to.
+static void drawProgressBar(int x,int y,int width,int height,double fraction){
+  roundedRect(x,y,width,height,height/2,COL_CARD);
+  const int filled=(int)(width*std::clamp(fraction,0.0,1.0));
+  if(filled>0)roundedRect(x,y,filled,height,height/2,COL_SEL);
+}
+
+static void drawRowHighlight(int x,int y,int width,int height){
+  roundedRect(x,y,width,height,4,COL_FOCUS);
+  fillRect(x,y+height/5,3,height*3/5,COL_SEL);
+}
+// X of a 4px list scrollbar sitting in the gutter right of a settings column.
+// In portrait the column nearly fills the screen, so the usual +16 gutter falls
+// off the right edge and only half the track is visible; clamp it back on.
+static int listTrackX(int colX,int colW){ return std::min(colX+colW+16,SW-10); }
 
 static void drawText(TTF_Font*f,int x,int y,const char*s,SDL_Color c){
   if(!f||!s||!*s) return;
@@ -1425,24 +1518,26 @@ static void drawText(TTF_Font*f,int x,int y,const char*s,SDL_Color c){
   auto found=g_textCache.find(key);
   if(found!=g_textCache.end()){
     found->second.use=++g_textUseSerial;
-    SDL_Rect d={x,y,found->second.width,found->second.height};
-    SDL_RenderCopy(g_ren,found->second.texture,nullptr,&d);
+    SDL_FRect d={(float)x,(float)y,found->second.width,found->second.height};
+    SDL_RenderCopyF(g_ren,found->second.texture,nullptr,&d);
     return;
   }
   SDL_Surface*sf=TTF_RenderUTF8_Blended(f,s,c); if(!sf) return;
   SDL_Texture*t=SDL_CreateTextureFromSurface(g_ren,sf);
-  int w=sf->w,h=sf->h; SDL_FreeSurface(sf);
+  const size_t bytes=(size_t)sf->w*(size_t)sf->h*4;
+  const float w=sf->w/g_fontScale,h=sf->h/g_fontScale; SDL_FreeSurface(sf);
   if(!t) return;
-  rememberTextMetric(f,s,w);
-  const size_t bytes=(size_t)w*(size_t)h*4;
+  rememberTextMetric(f,s,(int)std::ceil(w));
   if(bytes<=TEXT_CACHE_BYTES){
     evictTextEntries(bytes);
     TextEntry entry{t,w,h,bytes,++g_textUseSerial};
     auto inserted=g_textCache.emplace(std::move(key),entry);
     g_textCacheBytes+=bytes;
-    SDL_Rect d={x,y,w,h}; SDL_RenderCopy(g_ren,inserted.first->second.texture,nullptr,&d);
+    SDL_FRect d={(float)x,(float)y,w,h};
+    SDL_RenderCopyF(g_ren,inserted.first->second.texture,nullptr,&d);
   } else {
-    SDL_Rect d={x,y,w,h}; SDL_RenderCopy(g_ren,t,nullptr,&d); SDL_DestroyTexture(t);
+    SDL_FRect d={(float)x,(float)y,w,h};
+    SDL_RenderCopyF(g_ren,t,nullptr,&d); SDL_DestroyTexture(t);
   }
 }
 static int textW(TTF_Font*f,const char*s){
@@ -1450,6 +1545,7 @@ static int textW(TTF_Font*f,const char*s){
   MetricKey key{f,s}; auto found=g_metricCache.find(key);
   if(found!=g_metricCache.end()){ found->second.use=++g_textUseSerial; return found->second.width; }
   int w=0,h=0; if(TTF_SizeUTF8(f,s,&w,&h)!=0) return 0;
+  w=fontMetric(w);
   rememberTextMetric(f,s,w); return w;
 }
 
@@ -1485,6 +1581,10 @@ static const std::string &ellipsizedText(TTF_Font *font, const std::string &text
 static std::string fittedText(TTF_Font *font,const std::string &text,int maxWidth){
   return textW(font,text.c_str())<=maxWidth?text:ellipsizedText(font,text,maxWidth);
 }
+// Short spelling of the catalog lookup, for list labels built at runtime.
+static std::string uiText(const char *text){
+  return std::string(LauncherLocalization::Translate(text?text:""));
+}
 static void drawTextR(TTF_Font*f,int xr,int y,const char*s,SDL_Color c){ drawText(f,xr-textW(f,s),y,s,c); }
 static void drawTextC(TTF_Font*f,int cx,int y,const char*s,SDL_Color c){ drawText(f,cx-textW(f,s)/2,y,s,c); }
 
@@ -1501,11 +1601,14 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
                     const SDL_Color *swatches=nullptr);
 static void beginScreenFx();
 static void drawFadeIn();
+static void listCol(int *colX,int *colW,int *labelX,int *valX);
+static void drawSectionHeading(const char *title,int x,int y,int width);
 static int topBarH();
-static bool highResolutionUi();
 static int settingsRowH();
 static int settingsListY();
 static int settingsFooterReserve();
+static void drawPageHeader(const char *title,const char *eyebrow,const char *summary,
+                           const char *detail);
 static void drawHeader(const char *title,const char *ctx);
 static void drawSettingsRowText(const char *label,const char *value,
                                 int slotY,int colW,int labelX,int valX,
@@ -1531,7 +1634,9 @@ static SDL_Texture *makeFlagTex(int region,int W,int H){
   if(!t) return nullptr;
   SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND);
   SDL_Texture *previous=SDL_GetRenderTarget(g_ren);
+  float scaleX=1.0f,scaleY=1.0f;SDL_RenderGetScale(g_ren,&scaleX,&scaleY);
   SDL_SetRenderTarget(g_ren,t);
+  SDL_RenderSetScale(g_ren,1.0f,1.0f);
   SDL_SetRenderDrawColor(g_ren,0,0,0,0); SDL_RenderClear(g_ren);
   if(region==3){
     fillRect(0,0,W,H,(SDL_Color){245,245,245,255});
@@ -1546,6 +1651,7 @@ static SDL_Texture *makeFlagTex(int region,int W,int H){
       fillRect(sx-1,sy-1,2,2,(SDL_Color){255,204,0,255}); }
   }
   SDL_SetRenderTarget(g_ren,previous);
+  SDL_RenderSetScale(g_ren,scaleX,scaleY);
   return t;
 }
 static void makeFlags(){ g_flag[1]=makeFlagTex(1,36,24); g_flag[2]=makeFlagTex(2,36,24); g_flag[3]=makeFlagTex(3,36,24); }
@@ -1558,13 +1664,15 @@ static SDL_Texture *g_gA=nullptr,*g_gB=nullptr,*g_gX=nullptr,*g_gY=nullptr,
 static const int GLYPH_SS = 3;
 static SDL_Texture *makeGlyph(const char *label, bool pill){
   if(!g_font_sm || !g_font_big) return nullptr;
-  const int S=GLYPH_SS, base=TTF_FontHeight(g_font_sm)+6;
+  const int S=GLYPH_SS, base=fontHeight(g_font_sm)+6;
   int H=base*S, W=(pill? base*8/5 : base)*S;
   SDL_Texture *t=SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,W,H);
   if(!t) return nullptr;
   SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND);
   SDL_Texture *previous=SDL_GetRenderTarget(g_ren);
+  float scaleX=1.0f,scaleY=1.0f;SDL_RenderGetScale(g_ren,&scaleX,&scaleY);
   SDL_SetRenderTarget(g_ren,t);
+  SDL_RenderSetScale(g_ren,1.0f,1.0f);
   SDL_SetRenderDrawColor(g_ren,0,0,0,0); SDL_RenderClear(g_ren);
   SDL_Color edge={14,16,22,255}, hi={92,99,114,255}, face={52,57,68,255}, ink={246,248,252,255};
   if(pill){
@@ -1586,11 +1694,12 @@ static SDL_Texture *makeGlyph(const char *label, bool pill){
     SDL_Rect d={(W-lw)/2,(H-lh)/2,lw,lh}; SDL_FreeSurface(sf);
     if(lt){ SDL_RenderCopy(g_ren,lt,nullptr,&d); SDL_DestroyTexture(lt); } }
   SDL_SetRenderTarget(g_ren,previous);
+  SDL_RenderSetScale(g_ren,scaleX,scaleY);
   return t;
 }
 static SDL_Texture *makeLayoutControlGlyph(bool resize){
   if(!g_font_sm||!g_font_big) return nullptr;
-  const int S=GLYPH_SS,base=TTF_FontHeight(g_font_sm)+6;
+  const int S=GLYPH_SS,base=fontHeight(g_font_sm)+6;
   // These hints contain detailed stick/D-pad silhouettes, so render them a
   // little larger than the single-letter face-button glyphs.  Resize only
   // needs the right-stick symbol; showing its implementation combo here made
@@ -1601,7 +1710,9 @@ static SDL_Texture *makeLayoutControlGlyph(bool resize){
   if(!texture) return nullptr;
   SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
   SDL_Texture *previous=SDL_GetRenderTarget(g_ren);
+  float scaleX=1.0f,scaleY=1.0f;SDL_RenderGetScale(g_ren,&scaleX,&scaleY);
   SDL_SetRenderTarget(g_ren,texture);
+  SDL_RenderSetScale(g_ren,1.0f,1.0f);
   SDL_SetRenderDrawColor(g_ren,0,0,0,0);SDL_RenderClear(g_ren);
   const SDL_Color edge={14,16,22,255},hi={92,99,114,255},
                   face={52,57,68,255},ink={246,248,252,255};
@@ -1653,6 +1764,7 @@ static SDL_Texture *makeLayoutControlGlyph(bool resize){
     dpad(H*147/100);
   }
   SDL_SetRenderTarget(g_ren,previous);
+  SDL_RenderSetScale(g_ren,scaleX,scaleY);
   return texture;
 }
 static void destroyGlyphs(){
@@ -1682,24 +1794,30 @@ static PlSharedFontType requestedUiFontType(){
 }
 static bool reloadUiFonts(){
   const PlSharedFontType requested=requestedUiFontType();
-  if(g_font&&g_font_sm&&g_font_big&&g_uiFontType==requested) return true;
+  // g_fontScale is part of the identity of the loaded faces: after a dock or
+  // undock the same font type still has to be reopened at the new scale.
+  if(g_font&&g_font_sm&&g_font_big&&g_font_caption&&g_uiFontType==requested&&
+     g_fontScale==g_uiScale) return true;
   if(!g_plReady) return false;
 
   PlFontData fontData{};
   if(R_FAILED(plGetSharedFontByType(&fontData,requested))||
      !fontData.address||!fontData.size||fontData.size>INT_MAX) return false;
-  const int scale=SH>=1080?1:0;
+  // Fonts are opened at the output resolution so glyphs stay crisp when the
+  // 720p layout is scaled up; every metric is converted back with fontMetric().
   auto openFont=[&](int size)->TTF_Font*{
     SDL_RWops *rw=SDL_RWFromConstMem(fontData.address,(int)fontData.size);
-    return rw?TTF_OpenFontRW(rw,1,size):nullptr;
+    return rw?TTF_OpenFontRW(rw,1,(int)std::lround(size*g_uiScale)):nullptr;
   };
-  TTF_Font *small=openFont(scale?26:20);
-  TTF_Font *normal=openFont(scale?32:26);
-  TTF_Font *big=openFont(scale?52:40);
-  if(!small||!normal||!big){
+  TTF_Font *small=openFont(20);
+  TTF_Font *normal=openFont(26);
+  TTF_Font *big=openFont(32);
+  TTF_Font *caption=openFont(14);
+  if(!small||!normal||!big||!caption){
     if(small) TTF_CloseFont(small);
     if(normal) TTF_CloseFont(normal);
     if(big) TTF_CloseFont(big);
+    if(caption) TTF_CloseFont(caption);
     return false;
   }
 
@@ -1708,7 +1826,9 @@ static bool reloadUiFonts(){
   if(g_font) TTF_CloseFont(g_font);
   if(g_font_sm) TTF_CloseFont(g_font_sm);
   if(g_font_big) TTF_CloseFont(g_font_big);
-  g_font=normal; g_font_sm=small; g_font_big=big;
+  if(g_font_caption) TTF_CloseFont(g_font_caption);
+  g_fontScale=g_uiScale;
+  g_font=normal; g_font_sm=small; g_font_big=big; g_font_caption=caption;
   g_uiFontType=requested;
   makeGlyphs();
   return true;
@@ -1716,7 +1836,7 @@ static bool reloadUiFonts(){
 
 enum FootAct { FA_NONE, FA_LAUNCH, FA_SORT, FA_OPTIONS, FA_SETTINGS, FA_FILTER, FA_PAGEL, FA_PAGER, FA_QUIT };
 struct FootItem { const char *button; const char *label; int act; };
-static SDL_Rect g_footHit[10]; static int g_footAct[10]; static int g_footN=0;
+static SDL_Rect g_footHit[10]; static int g_footAct[10]; static int g_footButton[10];
 static SDL_Texture *footerGlyph(const char *button){
   if(!button) return nullptr;
   if(!strcmp(button,"A")) return g_gA;
@@ -1741,40 +1861,57 @@ static void footerButtonSize(const char *button,int &width,int &height){
     width/=GLYPH_SS; height/=GLYPH_SS;
   } else {
     width=textW(g_font_sm,button?button:"")+14;
-    height=TTF_FontHeight(g_font_sm)+6;
+    height=fontHeight(g_font_sm)+6;
   }
+}
+// Hint labels are English keys; the catalog is consulted here so that
+// measuring and drawing can never disagree about the string's width.
+static std::string footerHintLabel(const char *label){
+  if(!label||!*label) return {};
+  return std::string(LauncherLocalization::Translate(label));
 }
 static int footerHintWidth(const char *button,const char *label){
   int width=0,height=0; footerButtonSize(button,width,height);
-  if(label&&*label) width+=8+textW(g_font_sm,label);
+  const std::string shown=footerHintLabel(label);
+  if(!shown.empty()) width+=8+textW(g_font_sm,shown.c_str());
   return width;
 }
-static void drawButtonHint(int x,int centerY,const char *button,const char *label){
+static void drawButtonHint(int x,int centerY,const char *button,const char *label,
+                           bool emphasis=false){
   int width=0,height=0; footerButtonSize(button,width,height);
   SDL_Texture *glyph=footerGlyph(button);
   if(glyph){
     SDL_Rect destination={x,centerY-height/2,width,height};
     SDL_RenderCopy(g_ren,glyph,nullptr,&destination);
   } else {
-    border(x,centerY-height/2,width,height,1,COL_DIM);
-    drawTextC(g_font_sm,x+width/2,centerY-TTF_FontHeight(g_font_sm)/2,
+    // Fallback keycap: the real glyph is a pill/disc, so match that shape.
+    roundedPanel(x,centerY-height/2,width,height,COL_CARD,COL_DIM,height/2);
+    drawTextC(g_font_sm,x+width/2,centerY-fontHeight(g_font_sm)/2,
               button?button:"",COL_TXT);
   }
-  if(label&&*label)
-    drawText(g_font_sm,x+width+8,centerY-TTF_FontHeight(g_font_sm)/2,label,COL_DIM);
+  const std::string shown=footerHintLabel(label);
+  if(!shown.empty())
+    drawText(g_font_sm,x+width+8,centerY-fontHeight(g_font_sm)/2,shown.c_str(),
+             emphasis?COL_TXT:COL_DIM);
 }
-static void drawFooterHints(const FootItem *it,int n,int cy){
-  const int gap=8;
-  const int pairGap=g_launcherPortrait?12:26;
-  const int glyphGap=g_launcherPortrait?8:16;
-  const int fh=TTF_FontHeight(g_font_sm),maxWidth=SW-24;
-  int itemWidth[10]={},gapAfter[10]={};
+// Measuring is split from drawing so the library grid can reserve exactly the
+// height the footer will occupy, wrapped rows included.
+struct FooterLayout {
+  int itemWidth[10]{},gapAfter[10]{},rowStart[10]{},rowEnd[10]{},rowWidth[10]{};
+  int rowCount=0,rowSpacing=0,height=0;
+};
+static FooterLayout measureFooter(const FootItem *it,int n){
+  FooterLayout result;
+  auto &itemWidth=result.itemWidth,&gapAfter=result.gapAfter;
+  auto &rowStart=result.rowStart,&rowEnd=result.rowEnd,&rowWidth=result.rowWidth;
+  int &rowCount=result.rowCount;
+  const int pairGap=g_launcherPortrait?12:26,glyphGap=g_launcherPortrait?8:16;
+  const int fh=fontHeight(g_font_sm),maxWidth=std::max(80,SW-24);
   for(int i=0;i<n&&i<10;i++){
-    bool hasLabel=it[i].label&&it[i].label[0];
+    const bool hasLabel=it[i].label&&it[i].label[0];
     itemWidth[i]=footerHintWidth(it[i].button,it[i].label);
     gapAfter[i]=hasLabel?pairGap:glyphGap;
   }
-  int rowStart[10]={0},rowEnd[10]={0},rowWidth[10]={0},rowCount=0;
   for(int first=0;first<n&&first<10;){
     int last=first,width=0;
     while(last<n&&last<10){
@@ -1789,7 +1926,22 @@ static void drawFooterHints(const FootItem *it,int n,int cy){
     rowCount++;
     first=last;
   }
-  const int rowSpacing=fh+14;
+  result.rowSpacing=fh+22;
+  result.height=(rowCount-1)*result.rowSpacing+fh+32;
+  return result;
+}
+static void drawFooterHints(const FootItem *it,int n,int cy){
+  const FooterLayout layout=measureFooter(it,n);
+  const auto &rowStart=layout.rowStart,&rowEnd=layout.rowEnd,&rowWidth=layout.rowWidth,
+             &gapAfter=layout.gapAfter;
+  const int rowCount=layout.rowCount,rowSpacing=layout.rowSpacing;
+  const int fh=fontHeight(g_font_sm),gap=8;
+  // Only a screen-bottom footer gets its own band; one drawn inside a modal
+  // panel keeps the panel's background.
+  if(cy>=SH-40){
+    fillRect(0,SH-layout.height,SW,layout.height,COL_PANEL);
+    fillRect(0,SH-layout.height,SW,1,(SDL_Color){255,255,255,18});
+  }
   g_footN=0;
   for(int row=0;row<rowCount;row++){
     const int rowY=cy-(rowCount-1-row)*rowSpacing;
@@ -1797,13 +1949,24 @@ static void drawFooterHints(const FootItem *it,int n,int cy){
     for(int i=rowStart[row];i<rowEnd[row];i++){
       int bw=0,bh=0; footerButtonSize(it[i].button,bw,bh);
       int x0=x;
-      drawButtonHint(x,rowY,it[i].button,it[i].label);
+      drawButtonHint(x,rowY,it[i].button,it[i].label,i==0);
       x+=bw;
-      bool hasLabel=it[i].label&&it[i].label[0];
-      if(hasLabel) x+=gap+textW(g_font_sm,it[i].label);
+      const std::string shownLabel=footerHintLabel(it[i].label);
+      if(!shownLabel.empty()) x+=gap+textW(g_font_sm,shownLabel.c_str());
       if(g_footN<10){
-        g_footHit[g_footN]={x0-6,rowY-bh/2-8,(x-x0)+12,std::max(bh,fh)+16};
+        g_footHit[g_footN]={x0-4,rowY-std::max(bh,fh)/2-8,(x-x0)+8,std::max(bh,fh)+16};
         g_footAct[g_footN]=it[i].act;
+        const char *b=it[i].button;
+        g_footButton[g_footN]=
+          !b?-1:
+          !strcmp(b,"A")?BTN_CONFIRM:
+          !strcmp(b,"B")?BTN_CANCEL:
+          !strcmp(b,"X")?BTN_SETTINGS:
+          !strcmp(b,"Y")?SDL_CONTROLLER_BUTTON_X:
+          !strcmp(b,"+")?SDL_CONTROLLER_BUTTON_START:
+          !strcmp(b,"-")?SDL_CONTROLLER_BUTTON_BACK:
+          !strcmp(b,"L")?SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+          !strcmp(b,"R")?SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:-1;
         g_footN++;
       }
       if(i+1<rowEnd[row]) x+=gapAfter[i];
@@ -1814,6 +1977,47 @@ static int footTapAct(int px,int py){
   for(int i=0;i<g_footN;i++){ SDL_Rect &r=g_footHit[i];
     if(px>=r.x && px<r.x+r.w && py>=r.y && py<r.y+r.h) return g_footAct[i]; }
   return FA_NONE;
+}
+// Tapping a footer hint synthesises the controller button it stands for, so
+// every hint on every screen is a touch target without per-screen code.
+static bool pressFooterButton(int x,int y){
+  for(int i=0;i<g_footN;i++){
+    const SDL_Rect &rect=g_footHit[i];
+    if(g_footButton[i]<0||x<rect.x||x>=rect.x+rect.w||y<rect.y||y>=rect.y+rect.h) continue;
+    SDL_Event press{};press.type=SDL_CONTROLLERBUTTONDOWN;
+    press.cbutton.button=(Uint8)g_footButton[i];
+    return SDL_PushEvent(&press)==1;
+  }
+  return false;
+}
+// The library grid's footer is needed both to draw it and to measure the space
+// it reserves, so it lives in one place.
+// The widest the library footer ever gets.  gridLayout() measures this rather
+// than the state-dependent set below, so the cover grid keeps the same geometry
+// whether or not the current view happens to offer every action.
+static std::array<FootItem,8> libraryFooter(){
+  return {{{"A","Launch",FA_LAUNCH},{"Y","Sort",FA_SORT},{"X","Settings",FA_SETTINGS},
+    {"+","Game Menu",FA_OPTIONS},{"-","Filter",FA_FILTER},{"L","",FA_PAGEL},
+    {"R","Page",FA_PAGER},{"B","Quit",FA_QUIT}}};
+}
+// What is actually pressable right now.  Launch, Sort and the per-game menu all
+// no-op on an empty view, and paging is meaningless on a single page; the empty
+// "L" label is the deliberate pair that lets L and R share one caption.
+static int libraryFooterFor(FootItem (&out)[8],int gameCount,int pageCount){
+  int hintCount=0;
+  if(gameCount>0){
+    out[hintCount++]={"A","Launch",FA_LAUNCH};
+    out[hintCount++]={"Y","Sort",FA_SORT};
+  }
+  out[hintCount++]={"X","Settings",FA_SETTINGS};
+  if(gameCount>0) out[hintCount++]={"+","Game Menu",FA_OPTIONS};
+  out[hintCount++]={"-","Filter",FA_FILTER};
+  if(pageCount>1){
+    out[hintCount++]={"L","",FA_PAGEL};
+    out[hintCount++]={"R","Page",FA_PAGER};
+  }
+  out[hintCount++]={"B","Quit",FA_QUIT};
+  return hintCount;
 }
 
 enum TouchKind { TOUCH_NONE, TOUCH_TAP, TOUCH_SWIPE_L, TOUCH_SWIPE_R, TOUCH_SCROLL_UP, TOUCH_SCROLL_DOWN };
@@ -1880,7 +2084,8 @@ static TouchKind touchFeed(const SDL_Event &e,int *ox,int *oy){
       return (g_touch.vertical?remaining:dy)<0?TOUCH_SCROLL_UP:TOUCH_SCROLL_DOWN;
     }
     if(fabsf(dx)>=SWIPE_DX && fabsf(dx)>fabsf(dy)*1.5f) return dx<0?TOUCH_SWIPE_L:TOUCH_SWIPE_R;
-    if(fabsf(dx)<=TAP_MOVE && fabsf(dy)<=TAP_MOVE && dt<=TAP_MS) return TOUCH_TAP;
+    if(fabsf(dx)<=TAP_MOVE && fabsf(dy)<=TAP_MOVE && dt<=TAP_MS)
+      return pressFooterButton((int)ux,(int)uy)?TOUCH_NONE:TOUCH_TAP;
   }
   return TOUCH_NONE;
 }
@@ -1925,6 +2130,11 @@ static SDL_GameController *g_pad=nullptr;
 static bool g_exitRequested=false;
 static int g_navHeld=0;
 static Uint32 g_navSince=0,g_navLast=0;
+// Events taken off SDL's queue by the frame wait are held here instead of
+// being pushed back: re-queuing appends them behind whatever SDL has since
+// added, so a press could be reordered or delayed past the frame that was
+// waiting for it.  pollUiEvent() drains this first, in arrival order.
+static std::deque<SDL_Event> g_waitedEvents;
 
 static void openController(int index) {
   if (!g_pad && index >= 0 && SDL_IsGameController(index))
@@ -1940,6 +2150,36 @@ static void closeController() {
   g_navSince = g_navLast = 0;
 }
 
+// Docking or undocking swaps the renderer output between 1280x720 and
+// 1920x1080 while the launcher is open.  Without this the logical space, the
+// render scale and the font scale all stay at their startup values and the
+// whole UI is mis-scaled until the launcher is restarted.
+static void handleOutputSizeChange() {
+  if(!g_ren||!g_win) return;
+  int width=0,height=0;
+  // Cheap first pass: the window is the thing that actually changes size, and
+  // querying it touches no renderer state.
+  SDL_GetWindowSize(g_win,&width,&height);
+  if(width<1||height<1||(width==g_outputW&&height==g_outputH)) return;
+  // SDL_GetRendererOutputSize reports the *bound render target's* size, so the
+  // rotation target has to be detached for the authoritative answer.
+  SDL_Texture *previous=SDL_GetRenderTarget(g_ren);
+  if(previous) SDL_SetRenderTarget(g_ren,nullptr);
+  const int queried=SDL_GetRendererOutputSize(g_ren,&width,&height);
+  if(previous) SDL_SetRenderTarget(g_ren,previous);
+  if(queried!=0||width<1||height<1) return;
+  if(width==g_outputW&&height==g_outputH) return;
+  g_outputW=width; g_outputH=height;
+  if(!configureLauncherOrientation(g_launcherRotation)) return;
+  // reloadUiFonts() reopens the faces at the new g_uiScale; it is a no-op when
+  // the scale has not actually moved.
+  if(g_fontScale!=g_uiScale) (void)reloadUiFonts();
+  clearTextCaches();
+  g_textScroll.clear();
+  g_footN=0;
+  g_touch={};
+}
+
 static bool beginUiFrame() {
   if (g_exitRequested) return false;
   if (!appletMainLoop()) {
@@ -1947,6 +2187,8 @@ static bool beginUiFrame() {
     return false;
   }
   if(g_pad&&!SDL_GameControllerGetAttached(g_pad)) closeController();
+  // Cheap query; catches a dock/undock even when SDL emits no window event.
+  handleOutputSizeChange();
   // Texture creation belongs to the SDL thread.  Image decoding/scaling is
   // performed by the cover worker and only completed pixel buffers arrive
   // here, capped to a small upload budget per frame.
@@ -1959,7 +2201,10 @@ static bool beginUiFrame() {
 static void waitForNextUiFrame(bool animated=true, Uint32 requestedDeadline=0) {
   for(;;){
     const Uint32 now=SDL_GetTicks();
-    const bool transitionActive=animated&&g_uiAnimations&&now-g_fxT<180;
+    const bool transitionActive=(animated&&g_uiAnimations&&now-g_fxT<180)||g_scrollTextActive;
+    // A vsynced present already blocked for the frame; sleeping on top of it
+    // would halve the marquee/transition cadence.
+    if(transitionActive&&g_presentVsync) return;
     Uint32 deadline=requestedDeadline;
     auto includeDeadline=[&](Uint32 candidate){
       if(candidate&&!SDL_TICKS_PASSED(now,candidate)&&
@@ -1974,7 +2219,9 @@ static void waitForNextUiFrame(bool animated=true, Uint32 requestedDeadline=0) {
       timeout=std::min(timeout,(int)std::min<Uint32>(remaining,250));
     }
     SDL_Event event{};
-    if(SDL_WaitEventTimeout(&event,std::max(1,timeout))){SDL_PushEvent(&event);return;}
+    if(SDL_WaitEventTimeout(&event,std::max(1,timeout))){
+      g_waitedEvents.push_back(event); return;
+    }
     const Uint32 after=SDL_GetTicks();
     if(transitionActive||
        (requestedDeadline&&SDL_TICKS_PASSED(after,requestedDeadline))||
@@ -2009,9 +2256,19 @@ static int keyboardNavigationButton(SDL_Keycode key) {
 }
 
 static bool pollUiEvent(SDL_Event &event) {
-  while (SDL_PollEvent(&event)) {
+  for (;;) {
+    if(!g_waitedEvents.empty()){
+      event=g_waitedEvents.front();
+      g_waitedEvents.pop_front();
+    } else if(!SDL_PollEvent(&event)) return false;
     if (event.type == SDL_QUIT) {
       g_exitRequested = true;
+      continue;
+    }
+    if (event.type == SDL_WINDOWEVENT &&
+        (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+         event.window.event == SDL_WINDOWEVENT_RESIZED)) {
+      handleOutputSizeChange();
       continue;
     }
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
@@ -2051,7 +2308,6 @@ static bool pollUiEvent(SDL_Event &event) {
     }
     return true;
   }
-  return false;
 }
 
 static void navRepeat(){
@@ -3454,29 +3710,37 @@ static bool transferFrame(TransferState &state) {
   while(pollUiEvent(event)){
     pumpStick(event);
     int tx=0,ty=0;
-    if(touchFeed(event,&tx,&ty)==TOUCH_TAP&&ty>=SH-100) state.cancelled.store(true);
+    if(touchFeed(event,&tx,&ty)==TOUCH_TAP&&ty>=SH-48) state.cancelled.store(true);
     if(event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL) state.cancelled.store(true);
   }
   std::string current;
   { std::lock_guard<std::mutex> lock(state.detailMutex); current=state.current; }
   clearUiBackground();
-  drawTextC(g_font_big,SW/2,80,"File transfer",COL_HI);
-  drawTextC(g_font_sm,SW/2,150,ellipsizedText(g_font_sm,current,SW-180).c_str(),COL_DIM);
-  int bw=SW*2/3,bx=(SW-bw)/2,by=SH/2-24,bh=42;
-  border(bx,by,bw,bh,2,COL_SEL);
+  // Shares the page header and the settings metrics with every other screen;
+  // the old hand-centred title at y=80 sat inside the header band.
+  drawHeader(LauncherLocalization::Translate("File transfer").data(),
+             current.empty()?nullptr:current.c_str());
+  const int panelWidth=std::min(SW-64,900),panelHeight=176;
+  const int panelX=(SW-panelWidth)/2;
+  const int panelTop=topBarH()+24,panelBottom=SH-settingsFooterReserve();
+  const int panelY=panelTop+std::max(0,(panelBottom-panelTop-panelHeight)/2);
+  glassPanel(panelX,panelY,panelWidth,panelHeight);
+  drawTextC(g_font_sm,SW/2,panelY+24,
+            ellipsizedText(g_font_sm,current,panelWidth-56).c_str(),COL_DIM);
+  const int bw=panelWidth-72,bx=(SW-bw)/2,by=panelY+74,bh=32;
   uint64_t done=state.done.load(std::memory_order_relaxed);
   uint64_t total=state.total.load(std::memory_order_relaxed);
   uint64_t progress=total?std::min(done,total):0;
-  int fill=total?(int)((bw-6)*progress/total):0;
-  fillRect(bx+3,by+3,fill,bh-6,COL_HI);
+  drawProgressBar(bx,by,bw,bh,total?(double)progress/(double)total:0.0);
   char text[96];
   int percent=total?(int)(progress*100/total):0;
   snprintf(text,sizeof(text),"%d%%  -  %.1f / %.1f MiB",percent,done/1048576.0,total/1048576.0);
-  drawTextC(g_font,SW/2,by+66,text,COL_TXT);
+  drawTextC(g_font,SW/2,by+bh+18,text,COL_TXT);
   if(state.cancelled.load())
-    drawTextC(g_font_sm,SW/2,SH-72,"Cancelling...",COL_VAL);
+    drawTextC(g_font_sm,SW/2,SH-26-fontHeight(g_font_sm)/2,
+              LauncherLocalization::Translate("Cancelling...").data(),COL_VAL);
   else
-    drawFooterText("B  Cancel",SH-72+TTF_FontHeight(g_font_sm)/2);
+    drawFooterText("B  Cancel");
   presentUi();
   return !state.cancelled.load();
 }
@@ -3629,6 +3893,31 @@ static bool executePaste(const std::string &folder) {
   return ok;
 }
 
+// One source of truth for the SMB form geometry.  The tap hit test and the
+// draw code used to recompute these values independently and could disagree.
+struct SmbFormLayout {
+  int rowHeight,y0,margin,helpWidth,gap,formWidth,panelHeight;
+  int helpX,helpY,helpHeight,buttonY,buttonHeight;
+};
+static SmbFormLayout smbFormLayout(int fieldCount) {
+  SmbFormLayout layout{};
+  layout.rowHeight=g_launcherPortrait?settingsRowH():54;
+  layout.y0=topBarH()+26;
+  layout.margin=g_launcherPortrait?36:56;
+  layout.helpWidth=g_launcherPortrait?SW-layout.margin*2:420;
+  layout.gap=g_launcherPortrait?24:28;
+  layout.formWidth=g_launcherPortrait?SW-layout.margin*2:
+                   SW-layout.margin*2-layout.helpWidth-layout.gap;
+  layout.panelHeight=fieldCount*layout.rowHeight+layout.rowHeight+30;
+  layout.helpX=g_launcherPortrait?layout.margin:layout.margin+layout.formWidth+layout.gap;
+  layout.helpY=g_launcherPortrait?layout.y0+layout.panelHeight+layout.gap:layout.y0-10;
+  layout.helpHeight=g_launcherPortrait?
+      std::max(250,std::min(360,SH-layout.helpY-settingsFooterReserve())):layout.panelHeight;
+  layout.buttonY=layout.y0+fieldCount*layout.rowHeight+10;
+  layout.buttonHeight=layout.rowHeight-4;
+  return layout;
+}
+
 static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
   SwitchStorage::SmbShare edited=share;
   constexpr int fieldCount=7,saveRow=7,totalRows=8;
@@ -3717,21 +4006,17 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
 
   while(!done){
     if(!beginUiFrame()) break;
+    const SmbFormLayout form=smbFormLayout(fieldCount);
     SDL_Event event; navRepeat();
     while(pollUiEvent(event)){
       pumpStick(event);
       int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
-      int scale=highResolutionUi()?3:2;
-      int rowHeight=g_launcherPortrait?settingsRowH():27*scale,y0=topBarH()+26;
-      int margin=g_launcherPortrait?(highResolutionUi()?72:36):(highResolutionUi()?90:56);
-      int helpWidth=g_launcherPortrait?SW-margin*2:(highResolutionUi()?570:420);
-      int gap=g_launcherPortrait?24:(highResolutionUi()?44:28);
-      int formWidth=g_launcherPortrait?SW-margin*2:SW-margin*2-helpWidth-gap;
       if(touch==TOUCH_TAP){
         if(ty>=SH-42){ done=true; continue; }
-        for(int index=0;index<fieldCount;index++) if(tx>=margin&&tx<margin+formWidth&&ty>=y0+index*rowHeight&&ty<y0+(index+1)*rowHeight){ sel=index; activate(); break; }
-        int buttonY=y0+fieldCount*rowHeight+10;
-        if(tx>=margin&&tx<margin+formWidth&&ty>=buttonY&&ty<buttonY+rowHeight){ sel=saveRow; activate(); }
+        const bool inForm=tx>=form.margin&&tx<form.margin+form.formWidth;
+        for(int index=0;index<fieldCount;index++)
+          if(inForm&&ty>=form.y0+index*form.rowHeight&&ty<form.y0+(index+1)*form.rowHeight){ sel=index; activate(); break; }
+        if(inForm&&ty>=form.buttonY&&ty<form.buttonY+form.buttonHeight){ sel=saveRow; activate(); }
         continue;
       }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
@@ -3743,17 +4028,12 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
     }
 
     clearUiBackground();
-    drawHeader(creating?"Add SMB network share":"Edit SMB network share",edited.name.empty()?nullptr:edited.name.c_str());
-    int scale=highResolutionUi()?3:2;
-    int rowHeight=g_launcherPortrait?settingsRowH():27*scale,y0=topBarH()+26;
-    int margin=g_launcherPortrait?(highResolutionUi()?72:36):(highResolutionUi()?90:56);
-    int helpWidth=g_launcherPortrait?SW-margin*2:(highResolutionUi()?570:420);
-    int gap=g_launcherPortrait?24:(highResolutionUi()?44:28);
-    int formWidth=g_launcherPortrait?SW-margin*2:SW-margin*2-helpWidth-gap;
-    int panelHeight=fieldCount*rowHeight+rowHeight+30;
-    int helpX=g_launcherPortrait?margin:margin+formWidth+gap;
-    int helpY=g_launcherPortrait?y0+panelHeight+gap:y0-10;
-    int helpHeight=g_launcherPortrait?std::max(250,std::min(highResolutionUi()?430:360,SH-helpY-64)):panelHeight;
+    drawHeader(LauncherLocalization::Translate(creating?"Add SMB network share":"Edit SMB network share").data(),
+               edited.name.empty()?nullptr:edited.name.c_str());
+    const int rowHeight=form.rowHeight,y0=form.y0,margin=form.margin;
+    const int helpWidth=form.helpWidth,formWidth=form.formWidth;
+    const int panelHeight=form.panelHeight,helpX=form.helpX,helpY=form.helpY;
+    const int helpHeight=form.helpHeight;
     glassPanel(margin,y0-10,formWidth,panelHeight);
     glassPanel(helpX,helpY,helpWidth,helpHeight);
     const char *labels[fieldCount]={"Display name","Server / IP address","Shared folder","Username","Password","Workgroup","Connect at startup"};
@@ -3769,21 +4049,23 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
     };
     for(int index=0;index<fieldCount;index++){
       int y=y0+index*rowHeight; bool current=sel==index;
-      if(current){ fillRect(margin+8,y,formWidth-16,rowHeight-2,COL_FOCUS); fillRect(margin+8,y,5,rowHeight-2,COL_SEL); }
+      if(current) drawRowHighlight(margin+8,y,formWidth-16,rowHeight-2);
       if(g_launcherPortrait)
         drawSettingsRowText(labels[index],values[index].c_str(),y,formWidth-16,
                             margin+30,margin+formWidth-24,current,
                             current?COL_VAL:COL_DIM,current?COL_VAL:COL_TXT,true);
       else {
-        drawText(g_font_sm,margin+30,y+(rowHeight-TTF_FontHeight(g_font_sm))/2,labels[index],current?COL_VAL:COL_DIM);
-        drawScrollTextR(g_font,margin+formWidth-24,y+(rowHeight-TTF_FontHeight(g_font))/2,formWidth/2-30,values[index].c_str(),current?COL_VAL:COL_TXT);
+        drawText(g_font_sm,margin+30,y+(rowHeight-fontHeight(g_font_sm))/2,labels[index],current?COL_VAL:COL_DIM);
+        drawScrollTextR(g_font,margin+formWidth-24,y+(rowHeight-fontHeight(g_font))/2,formWidth/2-30,values[index].c_str(),current?COL_VAL:COL_TXT);
       }
     }
-    int buttonY=y0+fieldCount*rowHeight+10; bool buttonSelected=sel==saveRow;
-    fillRect(margin+14,buttonY,formWidth-28,rowHeight-4,buttonSelected?COL_FOCUS:COL_CARD);
-    if(buttonSelected) border(margin+14,buttonY,formWidth-28,rowHeight-4,2,COL_SEL);
-    drawTextC(g_font,margin+formWidth/2,buttonY+(rowHeight-TTF_FontHeight(g_font))/2-2,
-              creating?"Connect and save":"Save changes",buttonSelected?COL_VAL:COL_HI);
+    const int buttonY=form.buttonY,buttonHeight=form.buttonHeight;
+    const bool buttonSelected=sel==saveRow;
+    // Shares the launcher-wide button shape rather than the list-row highlight.
+    drawButtonPanel(margin+14,buttonY,formWidth-28,buttonHeight,buttonSelected);
+    drawTextC(g_font,margin+formWidth/2,buttonY+(buttonHeight-fontHeight(g_font))/2,
+              LauncherLocalization::Translate(creating?"Connect and save":"Save changes").data(),
+              buttonSelected?COL_VAL:COL_HI);
 
     static const char *helpTitle[totalRows]={"Display name","Server / IP address","Shared folder","Username","Password","Workgroup","Connect at startup","Save share"};
     static const char *helpLine1[totalRows]={
@@ -3797,14 +4079,18 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
     const int helpContentY=g_launcherPortrait?helpY:y0;
     drawText(g_font_big,helpX+28,helpContentY+22,
              fittedText(g_font_big,helpTitle[sel],helpWidth-56).c_str(),COL_HI);
-    int helpLineHeight=TTF_FontHeight(g_font_sm)+4;
+    int helpLineHeight=fontHeight(g_font_sm)+4;
     drawWrapped(g_font_sm,helpX+28,helpContentY+92,helpWidth-56,helpLineHeight,2,helpLine1[sel],COL_TXT);
     drawWrapped(g_font_sm,helpX+28,helpContentY+156,helpWidth-56,helpLineHeight,2,helpLine2[sel],COL_DIM);
     std::string address="smb://"+(edited.server.empty()?std::string("server"):edited.server)+"/"+(edited.share.empty()?std::string("share"):sharedFolder());
-    drawText(g_font_sm,helpX+28,helpContentY+210,"Connection preview",COL_DIM);
+    drawText(g_font_sm,helpX+28,helpContentY+210,
+             LauncherLocalization::Translate("Connection preview").data(),COL_DIM);
     drawScrollTextL(g_font,helpX+28,helpContentY+244,helpWidth-56,address.c_str(),COL_VAL);
-    drawButtonHint(helpX+28,helpY+helpHeight-66,"A","Edit / toggle");
-    drawButtonHint(helpX+28,helpY+helpHeight-32,"B","Cancel");
+    // On the button row A saves the share instead of editing a field, so the
+    // hint says so rather than describing the row above it.
+    FootItem footer[2]={{"A",sel==saveRow?"Save":"Edit / toggle",FA_NONE},
+                        {"B","Cancel",FA_NONE}};
+    drawFooterHints(footer,2,SH-26);
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
   return saved;
@@ -3812,10 +4098,12 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
 
 static void networkSharesScreen() {
   int sel=0,top=0;
+  beginScreenFx();   // clears the caller's footer hit rects before the first poll
   for(;;){
     auto shares=loadSmbSharesFromStore(); int n=1+(int)shares.size();
-    const int listY=g_launcherPortrait?settingsListY():112;
-    const int rowHeight=g_launcherPortrait?(highResolutionUi()?104:84):60;
+    const int listY=settingsListY();
+    const int rowHeight=g_launcherPortrait?84:60;
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     int vis=std::max(1,(SH-listY-settingsFooterReserve())/rowHeight);
     sel=std::max(0,std::min(sel,n-1)); if(sel<top)top=sel; if(sel>=top+vis)top=sel-vis+1;
     bool rebuild=false;
@@ -3827,7 +4115,8 @@ static void networkSharesScreen() {
         if(touchScrollList(touch,sel,top,n,vis)) continue;
         if(touch==TOUCH_TAP){
           if(ty>=SH-48) return;
-          for(int row=0;row<vis&&top+row<n;row++){ int y=listY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
+          if(tx>=colX&&tx<colX+colW)
+            for(int row=0;row<vis&&top+row<n;row++){ int y=listY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
           continue;
         }
         if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
@@ -3873,20 +4162,32 @@ static void networkSharesScreen() {
       if(rebuild) break;
       clearUiBackground();
       std::string summary=std::to_string(shares.size())+(shares.size()==1?" saved share":" saved shares");
-      drawHeader("SMB network shares",summary.c_str());
+      drawHeader(LauncherLocalization::Translate("SMB network shares").data(),summary.c_str());
+      glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
       for(int row=0;row<vis&&top+row<n;row++){
         int index=top+row,y=listY+row*rowHeight; bool current=index==sel;
-        if(current){ fillRect(56,y-3,SW-112,rowHeight-4,COL_FOCUS); fillRect(56,y-3,5,rowHeight-4,COL_SEL); }
-        if(index==0) drawText(g_font,82,y+(rowHeight-TTF_FontHeight(g_font))/2-2,"[ Add SMB share ]",current?COL_VAL:COL_HI);
+        if(current) drawRowHighlight(colX,y,colW,rowHeight-4);
+        if(index==0)
+          drawText(g_font,labelX,y+(rowHeight-fontHeight(g_font))/2,
+                   LauncherLocalization::Translate("Add SMB share").data(),current?COL_VAL:COL_HI);
         else { const auto &share=shares[index-1]; bool mounted=SwitchStorage::IsSmbMounted(share.id);
           int nameY=y+(g_launcherPortrait?8:0);
-          drawText(g_font,82,nameY,
-                   fittedText(g_font,share.name,g_launcherPortrait?SW-340:SW/2).c_str(),current?COL_VAL:COL_TXT);
           std::string status=mounted?"Connected":(share.autoMount?"Disconnected - auto":"Disconnected");
-          drawTextR(g_font_sm,SW-82,nameY+4,status.c_str(),mounted?(SDL_Color){120,220,120,255}:COL_DIM);
+          const std::string shownStatus(LauncherLocalization::Translate(status));
+          const int statusWidth=textW(g_font_sm,shownStatus.c_str());
+          const int nameWidth=std::max(60,valX-labelX-statusWidth-24);
+          if(current) drawScrollTextL(g_font,labelX,nameY,nameWidth,share.name.c_str(),COL_VAL);
+          else drawText(g_font,labelX,nameY,fittedText(g_font,share.name,nameWidth).c_str(),COL_TXT);
+          drawTextR(g_font_sm,valX,nameY+4,shownStatus.c_str(),mounted?(SDL_Color){120,220,120,255}:COL_DIM);
           std::string address="smb://"+share.server+"/"+share.share+(share.path.empty()?std::string{}:"/"+share.path);
-          drawText(g_font_sm,82,y+(g_launcherPortrait?48:31),
-                   fittedText(g_font_sm,address,g_launcherPortrait?SW-164:SW-340).c_str(),COL_DIM); }
+          drawText(g_font_sm,labelX,y+(g_launcherPortrait?48:31),
+                   fittedText(g_font_sm,address,valX-labelX).c_str(),COL_DIM); }
+      }
+      if(n>vis){
+        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+        fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
+        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+        fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
       }
       drawFooterText("A  Select       B  Back");
       presentUi(); waitForNextUiFrame();
@@ -4092,15 +4393,38 @@ static bool browserActions(const BrowserItem &item,BrowserMode mode) {
   return false;
 }
 
+// The two rows above are the browser's footer talking to browserActions and to
+// the confirm handler: "Actions" is only offered where the dropdown would have
+// entries to show, and the confirm hint names what A will actually do with the
+// selected row -- a file is inert in the manager, where A only descends.
+static bool browserActionsAvailable(const BrowserItem &item,BrowserMode mode) {
+  if(item.kind!=BrowserItemKind::Directory&&item.kind!=BrowserItemKind::File&&
+     item.kind!=BrowserItemKind::Use) return false;
+  return mode==BrowserMode::Manage||item.directory;
+}
+static const char *browserConfirmHint(const BrowserItem &item,BrowserMode mode) {
+  switch(item.kind){
+    case BrowserItemKind::Directory: case BrowserItemKind::Location:
+    case BrowserItemKind::Smb:       case BrowserItemKind::Up:
+    case BrowserItemKind::ManageSmb: return "Open";
+    case BrowserItemKind::Use:       case BrowserItemKind::Paste:
+    case BrowserItemKind::Favorite:  return "Select";
+    case BrowserItemKind::File:      return mode==BrowserMode::SelectImage?"Select":nullptr;
+  }
+  return nullptr;
+}
+
 static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
   std::string current=normalizeLocationPath(start);
   if(!current.empty()&&!ensurePathMounted(current)) current.clear();
   int sel=0,top=0;
+  beginScreenFx();   // clears the caller's footer hit rects before the first poll
   for(;;){
     bool opened=false; auto items=browserItems(current,mode,opened);
     if(!opened){ modalMessage("Folder unavailable",{current,"","The device may be disconnected."}); current.clear(); sel=top=0; continue; }
-    const int rowHeight=g_launcherPortrait?settingsRowH():46;
-    const int listY=g_launcherPortrait?settingsListY():112;
+    const int rowHeight=settingsRowH()+2;
+    const int listY=settingsListY();
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     int n=(int)items.size();
     int vis=std::max(1,(SH-listY-settingsFooterReserve())/rowHeight);
     if(n==0){ current.clear(); continue; }
@@ -4113,8 +4437,13 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
         pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
         if(touchScrollList(touch,sel,top,n,vis)) continue;
         if(touch==TOUCH_TAP){
-          if(ty>=SH-48){ uiAudioPlay(UiSound::Back); return {}; }
-          for(int row=0;row<vis&&top+row<n;row++){ int y=listY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
+          // A tap that lands in the footer band but misses a hint rect must do
+          // what the visible "B  Back" legend promises - step up one level -
+          // not silently cancel the whole browse.  Synthesising the button
+          // keeps the two paths from ever drifting apart again.
+          if(ty>=SH-48){ SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CANCEL; SDL_PushEvent(&press); continue; }
+          if(tx>=colX&&tx<colX+colW)
+            for(int row=0;row<vis&&top+row<n;row++){ int y=listY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
           continue;
         }
         if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
@@ -4154,17 +4483,45 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
       if(rebuild) break;
       clearUiBackground();
       const char *title=mode==BrowserMode::Manage?"File manager":mode==BrowserMode::SelectImage?"Select local cover":"Select game folder";
-      drawHeader(title,current.empty()?"Locations":current.c_str());
+      drawHeader(LauncherLocalization::Translate(title).data(),
+                 current.empty()?LauncherLocalization::Translate("Locations").data():current.c_str());
+      // The list shares the settings column so every list in the launcher lines
+      // up, and the panel hugs the rows actually shown.
+      glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
       for(int row=0;row<vis&&top+row<n;row++){
         int index=top+row,slotY=listY+row*rowHeight;
-        int y=slotY+(rowHeight-TTF_FontHeight(g_font))/2;
+        int y=slotY+(rowHeight-fontHeight(g_font))/2;
         bool selected=index==sel; const auto &item=items[index];
-        if(selected){ fillRect(54,slotY-3,SW-108,rowHeight-4,COL_FOCUS); fillRect(54,slotY-3,5,rowHeight-4,COL_SEL); }
+        if(selected) drawRowHighlight(colX,slotY,colW,rowHeight-4);
         SDL_Color color=item.kind==BrowserItemKind::Use||item.kind==BrowserItemKind::Paste||item.kind==BrowserItemKind::Favorite?COL_HI:(item.directory?COL_TXT:(SDL_Color){120,220,120,255});
-        drawText(g_font,80,y,ellipsizedText(g_font,item.label,SW-180).c_str(),selected?COL_VAL:color);
+        const int nameWidth=valX-labelX;
+        // A long selected filename scrolls; the rest stay ellipsized.
+        if(selected) drawScrollTextL(g_font,labelX,y,nameWidth,item.label.c_str(),COL_VAL);
+        else drawText(g_font,labelX,y,ellipsizedText(g_font,item.label,nameWidth).c_str(),color);
       }
-      std::string footer=mode==BrowserMode::Manage?"A  Open       X  Actions       Y  Paste       +  Eject USB       B  Back":"A  Open / Select       X  Pin       B  Back";
-      drawFooterText(footer.c_str());
+      if(n>vis){
+        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+        fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
+        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+        fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
+      }
+      // Every hint here depends on the selected row or on the browser's state:
+      // "Actions" needs a real entry, "Paste" needs a loaded clipboard and a
+      // directory that can receive it, and "Eject USB" needs the selection to
+      // sit on removable storage.
+      const BrowserItem &selected=items[sel];
+      const std::string &ejectTarget=current.empty()?selected.path:current;
+      FootItem footer[5]={};int hintCount=0;
+      if(const char *confirm=browserConfirmHint(selected,mode))
+        footer[hintCount++]={"A",confirm,FA_NONE};
+      if(browserActionsAvailable(selected,mode))
+        footer[hintCount++]={"X",mode==BrowserMode::Manage?"Actions":"Pin",FA_NONE};
+      if(mode==BrowserMode::Manage&&!current.empty()&&!g_fileClipboard.path.empty())
+        footer[hintCount++]={"Y","Paste",FA_NONE};
+      if(mode==BrowserMode::Manage&&isUsbStoragePath(ejectTarget))
+        footer[hintCount++]={"+","Eject USB",FA_NONE};
+      footer[hintCount++]={"B","Back",FA_NONE};
+      drawFooterHints(footer,hintCount,SH-26);
       presentUi(); waitForNextUiFrame();
     }
   }
@@ -4397,6 +4754,27 @@ static void optAdjust(const Opt &o, int dir) {
   else if (o.type==OT_HOTKEY) iniSet(o.key,"None");
 }
 
+// The three questions a settings footer has to ask about the selected row
+// before it advertises a button.  Each one mirrors exactly what the matching
+// handler below will do, so a hint is only drawn when pressing it does
+// something: an option with no key or no default has nothing to restore, a
+// submenu or status line has no value to step, and a status line does nothing
+// at all when confirmed.
+static bool canResetOption(const Opt &o) {
+  return o.key && o.def &&
+         (o.type==OT_CHOICE || o.type==OT_RANGE || o.type==OT_SCALED_RANGE ||
+          o.type==OT_TEXT || o.type==OT_HOTKEY ||
+          o.type==OT_SHADER || o.type==OT_DATETIME);
+}
+static bool canAdjustOption(const Opt &o) {
+  return optEnabled(o) &&
+         (o.type==OT_CHOICE || o.type==OT_RANGE || o.type==OT_SCALED_RANGE ||
+          o.type==OT_HOTKEY);
+}
+static bool canActivateOption(const Opt &o) {
+  return o.type!=OT_STATUS && optEnabled(o);
+}
+
 static const char *captureButton(SDL_GameController *pad) {
   struct M { SDL_GameControllerButton b; const char *tok; };
   static const M map[] = {
@@ -4429,8 +4807,9 @@ static const char *captureButton(SDL_GameController *pad) {
     clearUiBackground();
     int pw=std::min(780,SW-64),ph=210,px=(SW-pw)/2,py=(SH-ph)/2;
     glassPanel(px,py,pw,ph);
-    border(px,py,pw,ph,3,COL_SEL);
-    drawTextC(g_font_big,SW/2,py+50,"Press a button to bind", COL_HI);
+    drawText(g_font_big,px+28,py+22,
+             fittedText(g_font_big,"Press a button to bind",pw-56).c_str(),COL_TXT);
+    fillRect(px+28,py+72,pw-56,1,(SDL_Color){255,255,255,24});
     char sub[64]; snprintf(sub,sizeof(sub),"wait %ds to cancel", remain);
     drawTextC(g_font,SW/2,py+126,sub, COL_DIM);
     presentUi();
@@ -4493,9 +4872,9 @@ static std::string captureButtonCombo(SDL_GameController *pad,const char *label)
     clearUiBackground();
     int pw=std::min(840,SW-64),ph=250,px=(SW-pw)/2,py=(SH-ph)/2;
     glassPanel(px,py,pw,ph);
-    border(px,py,pw,ph,3,COL_SEL);
     std::string title="Bind "; title+=label?label:"hotkey";
-    drawTextC(g_font_big,SW/2,py+42,title.c_str(),COL_HI);
+    drawText(g_font_big,px+28,py+22,fittedText(g_font_big,title,pw-56).c_str(),COL_TXT);
+    fillRect(px+28,py+72,pw-56,1,(SDL_Color){255,255,255,24});
     drawTextC(g_font,SW/2,py+104,armed?"Hold every button, then release them":"Release the button used to open this screen",COL_TXT);
     std::string current=maskText(captured|held);
     drawTextC(g_font,SW/2,py+148,current.empty()?"Waiting...":current.c_str(),current.empty()?COL_DIM:COL_VAL);
@@ -4508,58 +4887,58 @@ static std::string captureButtonCombo(SDL_GameController *pad,const char *label)
 }
 
 static float g_hy = -1;
-static void beginScreenFx(){ g_fxT = SDL_GetTicks(); g_hy = -1; }
+static void beginScreenFx(){ g_fxT = SDL_GetTicks(); g_hy = -1; g_textScroll.clear(); g_footN=0; }
 static void drawFadeIn(){
   if(!g_uiAnimations) return;
   const int D = 160; int el = (int)(SDL_GetTicks() - g_fxT);
   if (el < D) fillRect(0,0,SW,SH,(SDL_Color){0,0,0,(Uint8)(200*(D-el)/D)});
 }
-static bool highResolutionUi(){ return g_outputW>=1600; }
-static int topBarH(){
-  if(g_launcherPortrait) return highResolutionUi()?132:104;
-  return highResolutionUi()?112:80;
+// top-bar height, shared by the grid header (gridLayout y0) and the page header
+static int topBarH(){ return g_launcherPortrait?120:80; }
+// Left logo, small caption "eyebrow" above a large scrolling title, and
+// right-aligned summary/detail metadata.  The launcher logo is 16:9, so the
+// logo rect keeps that aspect instead of the reference's square one.
+static void drawPageHeader(const char *title,const char *eyebrow,const char *summary,
+                           const char *detail=nullptr){
+  const int height=topBarH(),margin=g_launcherPortrait?24:32;
+  const int logoH=48,logoW=logoH*16/9,left=margin+logoW+20;
+  fillRect(0,0,SW,height,COL_PANEL);
+  fillRect(0,height-1,SW,1,(SDL_Color){255,255,255,18});
+  if(g_logo){SDL_Rect rect={margin,16,logoW,logoH};SDL_RenderCopy(g_ren,g_logo,nullptr,&rect);}
+  const int metadataWidth=g_launcherPortrait?0:
+      std::min(SW/3,std::max(textW(g_font_sm,summary),textW(g_font_sm,detail)));
+  const int titleWidth=SW-left-margin-(metadataWidth?metadataWidth+32:0);
+  drawText(g_font_caption,left,9,fittedText(g_font_caption,eyebrow?eyebrow:"",titleWidth).c_str(),COL_DIM);
+  drawScrollTextL(g_font_big,left,31,titleWidth,title?title:"",COL_TXT);
+  if(g_launcherPortrait){
+    const int available=SW-margin*2;
+    const int rightWidth=std::min(available/2,textW(g_font_sm,detail));
+    drawText(g_font_sm,margin,height-34,
+             fittedText(g_font_sm,summary?summary:"",available-(rightWidth?rightWidth+24:0)).c_str(),COL_DIM);
+    if(detail)drawTextR(g_font_sm,SW-margin,height-34,fittedText(g_font_sm,detail,rightWidth).c_str(),COL_DIM);
+  }else{
+    if(summary)drawTextR(g_font_sm,SW-margin,16,fittedText(g_font_sm,summary,metadataWidth).c_str(),COL_TXT);
+    if(detail)drawTextR(g_font_sm,SW-margin,44,fittedText(g_font_sm,detail,metadataWidth).c_str(),COL_DIM);
+  }
 }
 static void drawHeader(const char *title, const char *ctx){
-  int bandH = topBarH() - 4;
-  fillRect(0,0,SW,bandH,COL_PANEL);
-  if(!hasAnimatedBackground()) fillRect(0,bandH,SW,2,COL_SEL);
-  if(g_launcherPortrait){
-    const int titleY=ctx&&*ctx?(highResolutionUi()?18:12):
-                     (bandH-TTF_FontHeight(g_font_big))/2;
-    const int logoH=std::min(bandH-18,highResolutionUi()?62:48);
-    const int logoW=logoH*16/9;
-    if(g_logo){
-      SDL_Rect logoRect={18,ctx&&*ctx?10:(bandH-logoH)/2,logoW,logoH};
-      SDL_RenderCopy(g_ren,g_logo,nullptr,&logoRect);
-    }
-    const int titleWidth=std::max(80,SW-2*(logoW+34));
-    const std::string shownTitle=fittedText(g_font_big,title,titleWidth);
-    drawTextC(g_font_big,SW/2,titleY,shownTitle.c_str(),COL_VAL);
-    if(ctx&&*ctx){
-      const int contextWidth=SW-52;
-      const std::string shownContext=fittedText(g_font_sm,ctx,contextWidth);
-      drawTextC(g_font_sm,SW/2,bandH-TTF_FontHeight(g_font_sm)-12,
-                shownContext.c_str(),COL_DIM);
-    }
-    return;
-  }
-  int lh = bandH - 12;
-  if(g_logo){ SDL_Rect ld={26,(bandH-lh)/2,lh*16/9,lh}; SDL_RenderCopy(g_ren,g_logo,nullptr,&ld); }
-  drawTextC(g_font_big,SW/2,(bandH-TTF_FontHeight(g_font_big))/2,title,COL_VAL);
-  if (ctx&&*ctx) {
-    int titleRight=SW/2+textW(g_font_big,title)/2;
-    int maxWidth=(SW-28)-titleRight-30;
-    if(maxWidth>40) drawScrollTextR(g_font_sm,SW-28,(bandH-TTF_FontHeight(g_font_sm))/2,maxWidth,ctx,COL_VAL);
-  }
+  drawPageHeader(title,"Drastic DS",ctx);
+}
+static void drawSectionHeading(const char *title,int x,int y,int width){
+  const std::string shown=fittedText(g_font_sm,LauncherLocalization::Translate(title).data(),width-24);
+  const int height=fontHeight(g_font_sm),shownWidth=textW(g_font_sm,shown.c_str());
+  fillRect(x,y+4,3,height-8,COL_SEL);
+  drawText(g_font_sm,x+14,y,shown.c_str(),COL_HI);
+  fillRect(x+shownWidth+30,y+height/2,width-shownWidth-30,1,(SDL_Color){255,255,255,28});
 }
 static int settingsRowH(){
-  return g_launcherPortrait?(highResolutionUi()?78:64):46;
+  return g_launcherPortrait?64:44;
 }
 static int settingsListY(){
-  return g_launcherPortrait?topBarH()+(highResolutionUi()?38:28):118;
+  return topBarH()+(g_launcherPortrait?28:24);
 }
 static int settingsFooterReserve(){
-  return g_launcherPortrait?(highResolutionUi()?104:88):72;
+  return g_launcherPortrait?120:80;
 }
 static int portraitRowInset(){
   /* Keep the selected row aligned with the same one-pixel gutter used by the
@@ -4567,11 +4946,50 @@ static int portraitRowInset(){
      detached from its text after the UI target was rotated. */
   return 1;
 }
+// The four game-detail screens (cover artwork, cover settings, forwarder
+// wizard, per-game menu) share one cover rect and one content rect instead of
+// each carrying its own hand-tuned portrait/landscape geometry.  The 2:3 cover
+// aspect matches the library grid's own artwork boxes.
+struct GameDetailLayout { SDL_Rect preview,content; };
+static GameDetailLayout gameDetailLayout(){
+  const int top=topBarH()+24,bottom=SH-settingsFooterReserve()-12;
+  if(g_launcherPortrait){
+    const int height=270,width=height*2/3;
+    return {{(SW-width)/2,top,width,height},
+            {32,top+height+32,SW-64,bottom-top-height-32}};
+  }
+  const int width=260,height=width*3/2;
+  return {{56,top+(bottom-top-height)/2,width,height},
+          {360,top,SW-416,bottom-top}};
+}
+static void drawArtworkPreview(SDL_Texture *texture,const SDL_Rect &rect,bool selected=false){
+  if(selected) roundedPanel(rect.x-10,rect.y-10,rect.w+20,rect.h+20,COL_PANEL,COL_SEL);
+  else glassPanel(rect.x-10,rect.y-10,rect.w+20,rect.h+20);
+  fillRect(rect.x,rect.y,rect.w,rect.h,COL_CARD);
+  if(texture){
+    SDL_SetTextureAlphaMod(texture,255);
+    SDL_SetTextureColorMod(texture,255,255,255);
+    SDL_RenderCopy(g_ren,texture,nullptr,&rect);
+  } else {
+    drawTextC(g_font_sm,rect.x+rect.w/2,rect.y+(rect.h-fontHeight(g_font_sm))/2,
+              LauncherLocalization::Translate("NO COVER").data(),COL_DIM);
+  }
+}
+// Game covers go through drawGameArtwork so a 32x32 ROM banner icon is centred
+// rather than stretched over the whole box.
+static void drawGamePreview(Game &game,const SDL_Rect &rect){
+  g_cover_budget=1; ensureCover(game,true);
+  glassPanel(rect.x-10,rect.y-10,rect.w+20,rect.h+20);
+  fillRect(rect.x,rect.y,rect.w,rect.h,COL_CARD);
+  if(game.cover) drawGameArtwork(game,rect.x,rect.y,rect.w,rect.h,255,255);
+  else drawTextC(g_font_sm,rect.x+rect.w/2,rect.y+(rect.h-fontHeight(g_font_sm))/2,
+                 LauncherLocalization::Translate("NO COVER").data(),COL_DIM);
+}
 static void listCol(int *colX,int *colW,int *labelX,int *valX){
-  int margin=g_launcherPortrait?(highResolutionUi()?72:36):180;
+  int margin=g_launcherPortrait?36:180;
   int w = SW-margin; if (w>980) w=980;
   *colW=w; *colX=(SW-w)/2;
-  int inset=g_launcherPortrait?(highResolutionUi()?34:26):40;
+  int inset=g_launcherPortrait?26:40;
   *labelX=*colX+inset; *valX=*colX+w-inset;
 }
 static int listVis(){
@@ -4582,7 +5000,7 @@ static int listVis(){
 static bool settingsRowNeedsStackedText(const char *label,const char *value,
                                         int labelX,int valX){
   if(!g_launcherPortrait) return false;
-  const int gap=highResolutionUi()?32:24;
+  const int gap=24;
   return textW(g_font,label)+gap+textW(g_font,value)>valX-labelX;
 }
 
@@ -4592,11 +5010,13 @@ static void drawSettingsRowText(const char *label,const char *value,
                                 SDL_Color valueColor,bool scrollValue,
                                 int rowHeight){
   const int actualRowHeight=rowHeight>0?rowHeight:settingsRowH();
+  if(!current)
+    fillRect(labelX,slotY+actualRowHeight-1,valX-labelX,1,(SDL_Color){255,255,255,10});
   if(settingsRowNeedsStackedText(label,value,labelX,valX)){
     const int maxWidth=std::max(40,valX-labelX);
-    const int labelHeight=TTF_FontHeight(g_font);
-    const int valueHeight=TTF_FontHeight(g_font_sm);
-    const int gap=highResolutionUi()?5:3;
+    const int labelHeight=fontHeight(g_font);
+    const int valueHeight=fontHeight(g_font_sm);
+    const int gap=3;
     const int blockHeight=labelHeight+gap+valueHeight;
     const int labelY=slotY+(actualRowHeight-blockHeight)/2;
     if(current)
@@ -4608,10 +5028,24 @@ static void drawSettingsRowText(const char *label,const char *value,
     drawScrollTextR(g_font_sm,valX,valueY,maxWidth,value,valueColor);
     return;
   }
-  const int y=slotY+(actualRowHeight-TTF_FontHeight(g_font))/2;
-  drawText(g_font,labelX,y,label,labelColor);
-  if(scrollValue) drawScrollTextR(g_font,valX,y,colW/2-40,value,valueColor);
-  else drawTextR(g_font,valX,y,value,valueColor);
+  // A literal ">" value means "opens a submenu" and renders as a chevron.
+  const bool submenu=value&&!strcmp(value,">");
+  const int valueWidth=submenu?16:std::min(textW(g_font_sm,value),colW/2-32);
+  const int labelWidth=std::max(40,valX-labelX-valueWidth-24);
+  const int y=slotY+(actualRowHeight-fontHeight(g_font))/2;
+  if(current) drawScrollTextL(g_font,labelX,y,labelWidth,label,labelColor);
+  else drawText(g_font,labelX,y,fittedText(g_font,label,labelWidth).c_str(),labelColor);
+  if(submenu){
+    const int cy=slotY+actualRowHeight/2;
+    SDL_SetRenderDrawColor(g_ren,valueColor.r,valueColor.g,valueColor.b,valueColor.a);
+    SDL_RenderDrawLine(g_ren,valX-10,cy-6,valX-4,cy);
+    SDL_RenderDrawLine(g_ren,valX-4,cy,valX-10,cy+6);
+  }else{
+    const int valueY=slotY+(actualRowHeight-fontHeight(g_font_sm))/2;
+    if(scrollValue) drawScrollTextR(g_font_sm,valX,valueY,colW/2-32,value,valueColor);
+    else drawTextR(g_font_sm,valX,valueY,
+                   fittedText(g_font_sm,value?value:"",colW/2-32).c_str(),valueColor);
+  }
 }
 
 static void drawFooterText(const char *text,int centerY){
@@ -4644,13 +5078,16 @@ static void drawFooterText(const char *text,int centerY){
   }
   g_footN=0;
   const int maxWidth=SW-32;
-  const int y=centerY>=0?centerY-TTF_FontHeight(g_font_sm)/2:SH-38;
+  const int y=centerY>=0?centerY-fontHeight(g_font_sm)/2:SH-38;
   drawTextC(g_font_sm,SW/2,y,fittedText(g_font_sm,text,maxWidth).c_str(),COL_DIM);
 }
 
 static void showHelpCard(const char *section,const char *title,const char *kind,
                          const std::string &description,const char *current,
                          const char *scope) {
+  // Drops the caller's footer hit rects (and its marquees) before the first
+  // frame is polled, so a tap here cannot fire the previous screen's buttons.
+  beginScreenFx();
   for(;;){
     if(!beginUiFrame()) return;
     SDL_Event event;
@@ -4669,7 +5106,6 @@ static void showHelpCard(const char *section,const char *title,const char *kind,
     const int panelHeight=std::min(SH-96,500);
     const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
     glassPanel(panelX,panelY,panelWidth,panelHeight);
-    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
     drawText(g_font_sm,panelX+40,panelY+24,section&&*section?section:"Settings",COL_DIM);
     const char *helpTitle=title&&*title?title:"Setting help";
     drawText(g_font_big,panelX+40,panelY+58,
@@ -4690,8 +5126,10 @@ static void showHelpCard(const char *section,const char *title,const char *kind,
     fillRect(panelX+40,bodyY-18,panelWidth-80,2,(SDL_Color){70,78,92,210});
     drawWrapped(g_font,panelX+40,bodyY,panelWidth-80,32,7,
                 description.c_str(),COL_TXT);
-    FootItem closeHints[]={{"A","Close",FA_NONE},{"B","",FA_NONE},{"X","",FA_NONE}};
-    drawFooterHints(closeHints,3,panelY+panelHeight-50);
+    // B and X close this card too, but an empty label draws a bare glyph that
+    // reads as a broken hint.  One legend for one action.
+    FootItem closeHints[]={{"A","Close",FA_NONE}};
+    drawFooterHints(closeHints,1,panelY+panelHeight-50);
     drawTextC(g_font_sm,SW/2,panelY+panelHeight-24,"Touch anywhere to close",COL_DIM);
     presentUi();
     waitForNextUiFrame();
@@ -4735,12 +5173,12 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
   int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
   int vis=listVis();
   const int rowH=settingsRowH(),listY=settingsListY();
-  glassPanel(colX-12,listY-10,colW+24,vis*rowH+18);
+  // The panel hugs the rows actually shown, so a short page draws no empty tail.
+  glassPanel(colX-12,listY-10,colW+24,std::min(vis,S.n-top)*rowH+18);
   const int rowInset=g_launcherPortrait?portraitRowInset():1;
   float ty = (float)(listY + (sel-top)*rowH + rowInset);
   g_hy = (!g_uiAnimations||g_hy<0) ? ty : g_hy + (ty-g_hy)*0.30f;
-  fillRect(colX,(int)g_hy,colW,rowH-rowInset*2,COL_FOCUS);
-  fillRect(colX,(int)g_hy,5,rowH-rowInset*2,COL_SEL);
+  drawRowHighlight(colX,(int)g_hy,colW,rowH-rowInset*2);
   for(int r=0;r<vis && top+r<S.n;r++){
     int i=top+r,slotY=listY+r*rowH; bool cur=(i==sel); bool en=optEnabled(S.opts[i]);
     SDL_Color lc = !en?(SDL_Color){92,98,110,255}:(cur?COL_VAL:COL_TXT);
@@ -4752,38 +5190,55 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     if(S.opts[i].key && !strcmp(S.opts[i].key,"Drastic/FirmwareColor")){
       int colorIndex=choiceIdx(S.opts[i]);
       if(colorIndex>=0 && colorIndex<(int)(sizeof(C_firmwareColorRgb)/sizeof(*C_firmwareColorRgb))){
-        const bool stacked=settingsRowNeedsStackedText(S.opts[i].label,v,labelX,valX);
-        TTF_Font *valueFont=stacked?g_font_sm:g_font;
+        const bool stacked=settingsRowNeedsStackedText(
+            LauncherLocalization::Translate(S.opts[i].label).data(),value.c_str(),labelX,valX);
+        TTF_Font *valueFont=g_font_sm;
         const int swatchSize=g_launcherPortrait?20:24;
-        int valueY=slotY+(rowH-TTF_FontHeight(valueFont))/2;
+        int valueY=slotY+(rowH-fontHeight(valueFont))/2;
         if(stacked){
-          const int gap=highResolutionUi()?5:3;
-          const int blockHeight=TTF_FontHeight(g_font)+gap+TTF_FontHeight(g_font_sm);
-          valueY=slotY+(rowH-blockHeight)/2+TTF_FontHeight(g_font)+gap;
+          const int gap=3;
+          const int blockHeight=fontHeight(g_font)+gap+fontHeight(g_font_sm);
+          valueY=slotY+(rowH-blockHeight)/2+fontHeight(g_font)+gap;
         }
-        const int swatchX=valX-textW(valueFont,v)-swatchSize-12;
-        const int swatchY=valueY+(TTF_FontHeight(valueFont)-swatchSize)/2;
-        fillRect(swatchX,swatchY,swatchSize,swatchSize,C_firmwareColorRgb[colorIndex]);
-        border(swatchX,swatchY,swatchSize,swatchSize,1,(SDL_Color){225,230,240,255});
+        const int swatchX=valX-textW(valueFont,value.c_str())-swatchSize-12;
+        const int swatchY=valueY+(fontHeight(valueFont)-swatchSize)/2;
+        roundedPanel(swatchX,swatchY,swatchSize,swatchSize,
+                     C_firmwareColorRgb[colorIndex],(SDL_Color){225,230,240,255},6);
       }
     }
   }
   if(S.n>vis){
-    int trH=vis*rowH, trX=colX+colW+16, trY=listY-2;
+    int trH=vis*rowH, trX=listTrackX(colX,colW), trY=listY-2;
     fillRect(trX,trY,4,trH,(SDL_Color){40,44,54,255});
     int thH=trH*vis/S.n, denom=(S.n-vis>0?S.n-vis:1);
     fillRect(trX,trY+(trH-thH)*top/denom,4,thH,COL_SEL);
   }
-  drawFooterText("Left / Right  Change       A  Choose       X  Help       B  Back");
+  // Only advertise what the selected row can actually do: a submenu, status
+  // line or shader row does not step with Left/Right, a status line does
+  // nothing at all when confirmed, and only a row with a key and a default can
+  // be restored.  Y is live here (runSettings resets on it), so it has to be on
+  // screen: an unadvertised destructive action is worse than a crowded footer.
+  FootItem footer[5]={};int hintCount=0;
+  if(canAdjustOption(S.opts[sel])) footer[hintCount++]={"Left / Right","Change",FA_NONE};
+  if(canActivateOption(S.opts[sel])) footer[hintCount++]={"A","Choose",FA_NONE};
+  footer[hintCount++]={"X","Help",FA_NONE};
+  if(canResetOption(S.opts[sel])) footer[hintCount++]={"Y","Reset",FA_NONE};
+  footer[hintCount++]={"B","Back",FA_NONE};
+  drawFooterHints(footer,hintCount,SH-26);
   drawFadeIn();
   presentUi();
 }
 
 static int dropdown(const char *title, const char *const *labels, int n, int cur,
                     const SDL_Color *swatches) {
+  if(n<1) return cur;
   int sel = (cur < 0 || cur >= n) ? 0 : cur, top = 0;
-  const int rowH = 52;
-  int vis = (SH - 200) / rowH; if (vis < 1) vis = 1; if (vis > n) vis = n;
+  // One source of truth for the panel geometry: the draw code and the hit test
+  // used to recompute it with different formulas and could disagree.
+  const int rowH = settingsRowH()+8;
+  const int vis = std::min(n,std::max(1,(SH-240)/rowH));
+  const int pw = std::min(900,SW-64), ph = 140+vis*rowH;
+  const int px = (SW-pw)/2, py = (SH-ph)/2, ly = py+80;
   beginScreenFx();
   for (;;) {
     if(!beginUiFrame()) return -1;
@@ -4793,8 +5248,11 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
         if(touchScrollList(tk,sel,top,n,vis)) continue;
-        if(tk==TOUCH_TAP){ int pw=SW>760?760:SW-160,px=(SW-pw)/2,ly=(SH-(90+vis*rowH))/2+70;
-          for(int r=0;r<vis&&top+r<n;r++){ int y=ly+r*rowH; if(ty>=y&&ty<y+rowH&&tx>=px&&tx<px+pw){ return top+r; } }
+        if(tk==TOUCH_TAP && tx>=px+8 && tx<px+pw-8){
+          for(int r=0;r<vis&&top+r<n;r++){
+            const int y=ly+r*rowH;
+            if(ty>=y&&ty<y+rowH) return top+r;
+          }
         } }
       if (e.type != SDL_CONTROLLERBUTTONDOWN) continue;
       switch (e.cbutton.button) {
@@ -4808,32 +5266,35 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
       if(top<0) top=0;
     }
     clearUiBackground();
-    int pw = SW>760?760:SW-160, ph = 90 + vis*rowH, px=(SW-pw)/2, py=(SH-ph)/2;
     glassPanel(px,py,pw,ph);
-    border(px,py,pw,ph,3,COL_SEL);
-    drawTextC(g_font_big, SW/2, py+18, title, COL_VAL);
-    int ly = py+70;
+    drawScrollTextL(g_font_big,px+28,py+22,pw-56,title,COL_TXT);
+    fillRect(px+28,py+66,pw-56,1,(SDL_Color){255,255,255,24});
     for(int r=0;r<vis && top+r<n;r++){
-      int i=top+r, y=ly+r*rowH; bool curr=(i==sel);
-      if(curr){ fillRect(px+8,y,pw-16,rowH-4,COL_FOCUS); fillRect(px+8,y,5,rowH-4,COL_SEL); }
-      int textX=px+34;
-      const int textY=y+(rowH-TTF_FontHeight(g_font))/2;
+      const int i=top+r, y=ly+r*rowH; const bool curr=(i==sel);
+      if(curr) drawRowHighlight(px+8,y,pw-16,rowH-4);
+      int textX=px+32;
+      const int textY=y+(rowH-fontHeight(g_font))/2;
       if(swatches){
         const int swatchSize=28;
         const int swatchY=y+(rowH-swatchSize)/2;
-        fillRect(textX,swatchY,swatchSize,swatchSize,swatches[i]);
-        border(textX,swatchY,swatchSize,swatchSize,1,(SDL_Color){225,230,240,255});
+        roundedPanel(textX,swatchY,swatchSize,swatchSize,swatches[i],
+                     (SDL_Color){225,230,240,255},6);
         textX+=swatchSize+14;
       }
-      const int textWidth=px+pw-34-textX;
+      const int textWidth=px+pw-44-textX;
       if(curr)
         drawScrollTextL(g_font,textX,textY,textWidth,labels[i],COL_VAL);
       else
         drawText(g_font,textX,textY,
-                 ellipsizedText(g_font,labels[i],textWidth).c_str(),COL_TXT);
+                 fittedText(g_font,labels[i],textWidth).c_str(),COL_TXT);
     }
-    if(n>vis){ int trH=vis*rowH,trX=px+pw-12,trY=ly; fillRect(trX,trY,4,trH,(SDL_Color){40,44,54,255});
-      int thH=trH*vis/n,dn=(n-vis>0?n-vis:1); fillRect(trX,trY+(trH-thH)*top/dn,4,thH,COL_SEL); }
+    if(n>vis){
+      const int height=vis*rowH, thumb=std::max(12,height*vis/n);
+      fillRect(px+pw-18,ly,3,height,COL_CARD);
+      fillRect(px+pw-18,ly+(height-thumb)*top/(n-vis),3,thumb,COL_SEL);
+    }
+    FootItem footer[]={{"A","Select",FA_NONE},{"B","Back",FA_NONE}};
+    drawFooterHints(footer,2,py+ph-28);
     drawFadeIn();
     presentUi();
     waitForNextUiFrame();
@@ -4987,6 +5448,28 @@ static float launcherLayoutAxis(SDL_GameController *pad,
   return layoutClamp((float)value/32767.0f,-1.0f,1.0f);
 }
 
+// The layout editor's footer is needed both to draw it and to measure how much
+// room the preview canvas may claim, so it lives in one place.
+static std::array<FootItem,7> layoutEditorFooter(){
+  return {{{"Layout move","Move",FA_NONE},{"Layout resize","Resize",FA_NONE},
+    {"X","Screen",FA_NONE},{"Y","Reset",FA_NONE},{"R","Lock",FA_NONE},
+    {"A","Save",FA_NONE},{"B","Cancel",FA_NONE}}};
+}
+// One source of truth for the preview canvas: the tap hit test and the renderer
+// used to recompute this identically, which is exactly how they drift apart.
+struct LayoutEditorCanvas { int x,y,width,height; };
+static LayoutEditorCanvas layoutEditorCanvas(){
+  const int margin=g_launcherPortrait?20:60;
+  const auto hints=layoutEditorFooter();
+  const int areaTop=topBarH()+58;
+  const int areaBottom=SH-measureFooter(hints.data(),(int)hints.size()).height-12;
+  int width=SW-margin*2;
+  int height=(width*9+8)/16;
+  const int maxHeight=std::max(1,areaBottom-areaTop);
+  if(height>maxHeight){ height=maxHeight; width=height*16/9; }
+  return {(SW-width)/2,areaTop+(maxHeight-height)/2,width,height};
+}
+
 static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
   const std::string editorTitle=
       std::string(LauncherLocalization::Translate("Custom screen layout"));
@@ -5015,6 +5498,7 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
 
   for(;;){
     if(!beginUiFrame()) return;
+    const LayoutEditorCanvas canvas=layoutEditorCanvas();
     float moveX=0.0f,moveY=0.0f,sizeX=0.0f,sizeY=0.0f;
     SDL_Event event;
     while(pollUiEvent(event)){
@@ -5055,19 +5539,11 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
           (resize?sizeY:moveY)+=step;
       }
       if(touch==TOUCH_TAP){
-        const int margin=g_launcherPortrait?20:60;
-        const int areaTop=topBarH()+58,areaBottom=SH-76;
-        int canvasWidth=SW-margin*2;
-        int canvasHeight=(canvasWidth*9+8)/16;
-        const int maxHeight=std::max(1,areaBottom-areaTop);
-        if(canvasHeight>maxHeight){canvasHeight=maxHeight;canvasWidth=canvasHeight*16/9;}
-        const int canvasX=(SW-canvasWidth)/2;
-        const int canvasY=areaTop+(maxHeight-canvasHeight)/2;
         for(int screen=1;screen>=0;screen--){
-          const int x=canvasX+(int)std::lround(rects[screen].x*canvasWidth);
-          const int y=canvasY+(int)std::lround(rects[screen].y*canvasHeight);
-          const int width=(int)std::lround(rects[screen].width*canvasWidth);
-          const int height=(int)std::lround(rects[screen].height*canvasHeight);
+          const int x=canvas.x+(int)std::lround(rects[screen].x*canvas.width);
+          const int y=canvas.y+(int)std::lround(rects[screen].y*canvas.height);
+          const int width=(int)std::lround(rects[screen].width*canvas.width);
+          const int height=(int)std::lround(rects[screen].height*canvas.height);
           if(touchX>=x&&touchX<x+width&&touchY>=y&&touchY<y+height){
             selected=screen;break;
           }
@@ -5097,17 +5573,11 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
 
     clearUiBackground();
     drawHeader(editorTitle.c_str(),editorScope.c_str());
-    const int margin=g_launcherPortrait?20:60;
-    const int areaTop=topBarH()+58,areaBottom=SH-76;
-    int canvasWidth=SW-margin*2;
-    int canvasHeight=(canvasWidth*9+8)/16;
-    const int maxHeight=std::max(1,areaBottom-areaTop);
-    if(canvasHeight>maxHeight){canvasHeight=maxHeight;canvasWidth=canvasHeight*16/9;}
-    const int canvasX=(SW-canvasWidth)/2;
-    const int canvasY=areaTop+(maxHeight-canvasHeight)/2;
+    const int canvasX=canvas.x,canvasY=canvas.y;
+    const int canvasWidth=canvas.width,canvasHeight=canvas.height;
     glassPanel(canvasX-8,canvasY-8,canvasWidth+16,canvasHeight+16);
-    fillRect(canvasX,canvasY,canvasWidth,canvasHeight,(SDL_Color){7,10,15,255});
-    border(canvasX,canvasY,canvasWidth,canvasHeight,2,(SDL_Color){75,88,105,255});
+    roundedPanel(canvasX,canvasY,canvasWidth,canvasHeight,(SDL_Color){7,10,15,255},
+                 (SDL_Color){75,88,105,255},4,2);
 
     for(int pass=0;pass<2;pass++){
       const int screen=pass==1?selected:1-selected;
@@ -5123,9 +5593,9 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
       border(x,y,width,height,current?4:2,color);
       const std::string &label=screen?touchScreen:topScreen;
       if(width>textW(g_font_sm,label.c_str())+20&&
-         height>TTF_FontHeight(g_font_sm)+16){
+         height>fontHeight(g_font_sm)+16){
         fillRect(x+7,y+7,textW(g_font_sm,label.c_str())+14,
-                 TTF_FontHeight(g_font_sm)+8,(SDL_Color){8,14,21,220});
+                 fontHeight(g_font_sm)+8,(SDL_Color){8,14,21,220});
         drawText(g_font_sm,x+14,y+11,label.c_str(),color);
       }
     }
@@ -5151,12 +5621,8 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
         aspectLock?"Aspect lock: On":"Aspect lock: Off"));
     drawTextR(g_font_sm,canvasX+canvasWidth,statusY,lockText.c_str(),
               aspectLock?(SDL_Color){105,225,145,255}:COL_VAL);
-    const FootItem footer[]={
-      {"Layout move","Move",FA_NONE},{"Layout resize","Resize",FA_NONE},
-      {"X","Screen",FA_NONE},{"Y","Reset",FA_NONE},{"R","Lock",FA_NONE},
-      {"A","Save",FA_NONE},{"B","Cancel",FA_NONE},
-    };
-    drawFooterHints(footer,(int)(sizeof(footer)/sizeof(*footer)),SH-26);
+    const auto footer=layoutEditorFooter();
+    drawFooterHints(footer.data(),(int)footer.size(),SH-26);
     drawFadeIn();
     presentUi();
     waitForNextUiFrame(true,SDL_GetTicks()+16);
@@ -5186,16 +5652,19 @@ static void editCustomClock(const Opt &option) {
   beginScreenFx();
   for(;;) {
     if(!beginUiFrame()) return;
+    // One panel geometry per frame, shared by the hit test and the renderer.
+    const int panelW=660,panelH=430;
+    const int panelX=(SW-panelW)/2,panelY=(SH-panelH)/2;
+    const int rowH=54,firstRowY=panelY+92;
     SDL_Event event;
     navRepeat();
     while(pollUiEvent(event)) {
       pumpStick(event);
       int touchX=0,touchY=0;
       TouchKind touch=touchFeed(event,&touchX,&touchY);
-      if(touch==TOUCH_TAP) {
-        int panelY=(SH-430)/2;
-        for(int row=0;row<5;row++)
-          if(touchY>=panelY+92+row*54 && touchY<panelY+146+row*54)
+      if(touch==TOUCH_TAP && touchX>=panelX+24 && touchX<panelX+panelW-24) {
+        for(int row=0;row<5;row++)   // same band the highlight is drawn in
+          if(touchY>=firstRowY+row*rowH-8 && touchY<firstRowY+row*rowH+40)
             selected=row;
       }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
@@ -5233,20 +5702,18 @@ static void editCustomClock(const Opt &option) {
     }
 
     clearUiBackground();
-    drawHeader("Custom clock",nullptr);
-    int panelW=660,panelH=430,panelX=(SW-panelW)/2,panelY=(SH-panelH)/2;
+    drawHeader(LauncherLocalization::Translate("Custom clock").data(),nullptr);
     glassPanel(panelX,panelY,panelW,panelH);
-    border(panelX,panelY,panelW,panelH,3,COL_SEL);
     drawTextC(g_font_sm,SW/2,panelY+30,
-              "Starting date and time (local)",COL_DIM);
+              LauncherLocalization::Translate("Starting date and time (local)").data(),COL_DIM);
     for(int row=0;row<5;row++) {
-      int y=panelY+92+row*54;
+      int y=firstRowY+row*rowH;
       bool current=row==selected;
       if(current) {
-        fillRect(panelX+24,y-8,panelW-48,48,COL_FOCUS);
-        fillRect(panelX+24,y-8,5,48,COL_SEL);
+        drawRowHighlight(panelX+24,y-8,panelW-48,48);
       }
-      drawText(g_font,panelX+58,y,labels[row],current?COL_VAL:COL_TXT);
+      drawText(g_font,panelX+58,y,
+               LauncherLocalization::Translate(labels[row]).data(),current?COL_VAL:COL_TXT);
       char value[16];
       if(row==0) snprintf(value,sizeof(value),"%04d",values[row]);
       else snprintf(value,sizeof(value),"%02d",values[row]);
@@ -5278,7 +5745,7 @@ static const Opt *findHotkeyConflict(const Opt &option,
 
 static int s_setSel[SCR_COUNT]={0}, s_setTop[SCR_COUNT]={0};
 static bool resetOption(const Opt &option){
-  if(!option.key||!option.def)return false;
+  if(!canResetOption(option))return false;
   if(g_active==&g_game){
     const bool existed=storeHas(g_game,option.key);storeRemove(g_game,option.key);return existed;
   }
@@ -5435,15 +5902,23 @@ static void launcherSettingsScreen() {
   beginScreenFx();
   for(;;){
     if(!beginUiFrame()){ finish(); return; }
+    // Recomputed once per frame and shared by the hit test and the renderer, so
+    // an orientation or resolution change cannot desynchronise the two.
+    const int rowH=settingsRowH(),listY=settingsListY();
+    const int buttonWidth=std::min(500,SW-80),buttonHeight=58;
+    const int buttonReserve=buttonHeight+settingsFooterReserve()+46;
+    const int visible=std::min(std::max(1,(SH-listY-buttonReserve)/rowH),listCount);
+    // Scroll the saved row back into view, or the highlight is drawn for a row
+    // the window does not contain.
+    if(sel<listCount&&sel>=top+visible) top=std::min(sel-visible+1,std::max(0,listCount-visible));
+    if(sel<top) top=sel;
+    const int buttonX=(SW-buttonWidth)/2;
+    const int buttonY=std::min(SH-buttonHeight-settingsFooterReserve()-24,
+                               listY+visible*rowH+24);
     SDL_Event event; navRepeat();
     while(pollUiEvent(event)){
       pumpStick(event);
       int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
-      const int rowH=settingsRowH(),listY=settingsListY();
-      const int visible=std::min(std::max(1,(SH-listY-190)/rowH),listCount);
-      const int buttonWidth=std::min(500,SW-80),buttonHeight=58;
-      const int buttonX=(SW-buttonWidth)/2;
-      const int buttonY=std::min(SH-buttonHeight-104,listY+visible*rowH+24);
       if(touchScrollList(touch,sel,top,listCount,visible)) continue;
       if(touch==TOUCH_SWIPE_L&&sel<optionCount){ optAdjust(S_launcher[sel],-1); applyChange(); continue; }
       if(touch==TOUCH_SWIPE_R&&sel<optionCount){ optAdjust(S_launcher[sel],1); applyChange(); continue; }
@@ -5494,8 +5969,11 @@ static void launcherSettingsScreen() {
                        nullptr,"Launcher action");
         beginScreenFx();
       } else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X){
+        // Reset belongs to the option rows and the API key row only.  It used
+        // to fall through on the "Check for Updates" button and silently wipe
+        // the stored SteamGridDB key, which no hint ever promised.
         if(sel<optionCount){if(resetOption(S_launcher[sel])){applyChange();toast("Setting reset to default",450);}}
-        else{storeRemove(g_global,"Wrapper/SteamGridDBKey");toast("Setting reset to default",450);}
+        else if(sel==apiKeyRow){storeRemove(g_global,"Wrapper/SteamGridDBKey");toast("Setting reset to default",450);}
       } else if(event.cbutton.button==BTN_CANCEL){ finish(); return; }
       if(sel<listCount){
         if(sel<top) top=sel;
@@ -5504,41 +5982,54 @@ static void launcherSettingsScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Launcher",nullptr);
+    drawHeader(LauncherLocalization::Translate("Launcher").data(),nullptr);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
-    const int rowH=settingsRowH(),listY=settingsListY();
-    const int visible=std::min(std::max(1,(SH-listY-190)/rowH),listCount);
-    glassPanel(colX-12,listY-10,colW+24,visible*rowH+18);
+    // The panel hugs the rows actually shown instead of always reserving room
+    // for a full page.
+    glassPanel(colX-12,listY-10,colW+24,
+               std::min(visible,std::max(0,listCount-top))*rowH+18);
     const int rowInset=g_launcherPortrait?portraitRowInset():1;
     if(sel<listCount){
       float target=(float)(listY+(sel-top)*rowH+rowInset);
       g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
-      fillRect(colX,(int)g_hy,colW,rowH-rowInset*2,COL_FOCUS);
-      fillRect(colX,(int)g_hy,5,rowH-rowInset*2,COL_SEL);
+      drawRowHighlight(colX,(int)g_hy,colW,rowH-rowInset*2);
     }
     for(int row=0;row<visible&&top+row<listCount;row++){
       int index=top+row,slotY=listY+row*rowH; bool current=index==sel;
       if(index==apiKeyRow){
         const bool configured=storeGet(g_global,"Wrapper/SteamGridDBKey","")[0];
-        drawSettingsRowText("SteamGridDB API key",configured?"Configured":"Not configured",slotY,colW,labelX,valX,
+        drawSettingsRowText(LauncherLocalization::Translate("SteamGridDB API key").data(),
+                            LauncherLocalization::Translate(configured?"Configured":"Not configured").data(),
+                            slotY,colW,labelX,valX,
                             current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
       } else {
         char value[96]; optValue(S_launcher[index],value,sizeof(value));
-        drawSettingsRowText(S_launcher[index].label,value,slotY,colW,labelX,valX,
+        const std::string shown(LauncherLocalization::Translate(value));
+        drawSettingsRowText(LauncherLocalization::Translate(S_launcher[index].label).data(),
+                            shown.c_str(),slotY,colW,labelX,valX,
                             current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
       }
     }
-    const int buttonWidth=std::min(500,SW-80),buttonHeight=58;
-    const int buttonX=(SW-buttonWidth)/2;
-    const int buttonY=std::min(SH-buttonHeight-104,listY+visible*rowH+24);
     const bool updateSelected=sel==updateRow;
-    fillRect(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected?COL_FOCUS:(SDL_Color){35,40,50,225});
-    border(buttonX,buttonY,buttonWidth,buttonHeight,2,updateSelected?COL_SEL:COL_DIM);
-    const int fontHeight=TTF_FontHeight(g_font);
-    drawTextC(g_font,SW/2,buttonY+(buttonHeight-fontHeight)/2,"Check for Updates",updateSelected?COL_VAL:COL_TXT);
+    drawButtonPanel(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected);
+    const int updateButtonFontHeight=fontHeight(g_font);
+    drawTextC(g_font,SW/2,buttonY+(buttonHeight-updateButtonFontHeight)/2,
+              LauncherLocalization::Translate("Check for Updates").data(),
+              updateSelected?COL_VAL:COL_TXT);
     const std::string updateStatus=launcherUpdateStatusText();
     drawTextC(g_font_sm,SW/2,buttonY+buttonHeight+8,updateStatus.c_str(),updateSelected?COL_VAL:COL_DIM);
-  drawFooterText("Left / Right  Change       A  Choose       X  Help       Y  Reset       B  Back");
+    // `sel` addresses the API key row and the "Check for Updates" button as
+    // well as the option array, so both hints that only apply to a real Opt
+    // need the bound check before they can look one up.
+    FootItem footer[5]={};int hintCount=0;
+    if(sel<optionCount&&canAdjustOption(S_launcher[sel]))
+      footer[hintCount++]={"Left / Right","Change",FA_NONE};
+    footer[hintCount++]={"A","Choose",FA_NONE};
+    footer[hintCount++]={"X","Help",FA_NONE};
+    if(sel<optionCount?canResetOption(S_launcher[sel]):sel==apiKeyRow)
+      footer[hintCount++]={"Y","Reset",FA_NONE};
+    footer[hintCount++]={"B","Back",FA_NONE};
+    drawFooterHints(footer,hintCount,SH-26);
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
 }
@@ -5659,7 +6150,7 @@ static void runUpdateScreen() {
     const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
     const int bodyX=panelX+42,bodyY=panelY+126,bodyWidth=panelWidth-84;
     const int footerHeight=108,bodyBottom=panelY+panelHeight-footerHeight;
-    const int lineHeight=TTF_FontHeight(g_font_sm)+8;
+    const int lineHeight=fontHeight(g_font_sm)+8;
     const int visibleLines=std::max(1,(bodyBottom-bodyY)/lineHeight);
     if(snapshot.release.tag!=wrappedTag||snapshot.release.notes!=wrappedBody){
       wrappedTag=snapshot.release.tag;
@@ -5702,8 +6193,9 @@ static void runUpdateScreen() {
     clearUiBackground();
     fillRect(0,0,SW,SH,(SDL_Color){0,0,0,105});
     glassPanel(panelX,panelY,panelWidth,panelHeight);
-    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-    drawTextC(g_font_big,SW/2,panelY+24,"Drastic DS Update",COL_SEL);
+    drawText(g_font_big,panelX+28,panelY+18,
+             fittedText(g_font_big,"Drastic DS Update",panelWidth-56).c_str(),COL_TXT);
+    fillRect(panelX+28,panelY+66,panelWidth-56,1,(SDL_Color){255,255,255,24});
 
     std::string status;
     switch(snapshot.state){
@@ -5740,18 +6232,35 @@ static void runUpdateScreen() {
       const uint64_t total=snapshot.total?snapshot.total:snapshot.release.assetSize;
       const int percent=total?(int)std::min<uint64_t>(100,snapshot.downloaded*100/total):0;
       const int barX=bodyX,barY=panelY+panelHeight-82,barWidth=bodyWidth,barHeight=24;
-      border(barX,barY,barWidth,barHeight,2,COL_SEL);
-      fillRect(barX+3,barY+3,(barWidth-6)*percent/100,barHeight-6,COL_HI);
+      drawProgressBar(barX,barY,barWidth,barHeight,
+                      total?(double)snapshot.downloaded/(double)total:0.0);
       char progress[96];
       snprintf(progress,sizeof(progress),"%d%%    %.1f / %.1f MiB",percent,
         snapshot.downloaded/(1024.0*1024.0),total/(1024.0*1024.0));
       drawTextC(g_font_sm,SW/2,barY+30,progress,COL_DIM);
     } else {
-      const char *controls="B  Back       Up / Down  Scroll       L / R  Page";
-      if(snapshot.state==LauncherUpdateState::UpdateAvailable) controls="A  Download       B  Back       Up / Down  Scroll";
-      else if(snapshot.state==LauncherUpdateState::Error||snapshot.state==LauncherUpdateState::Cancelled) controls="A  Retry       B  Back";
-      else if(snapshot.state==LauncherUpdateState::Installed) controls="A  Exit Drastic DS";
-      drawFooterText(controls,panelY+panelHeight-38);
+      // A changes meaning with the state and is absent where it does nothing;
+      // B is deliberately dead once the update is installed; and the scroll
+      // hints only appear when the notes are actually longer than the panel.
+      FootItem footer[5]={};int hintCount=0;
+      if(snapshot.state==LauncherUpdateState::UpdateAvailable)
+        footer[hintCount++]={"A","Download",FA_NONE};
+      else if(snapshot.state==LauncherUpdateState::Error||
+              snapshot.state==LauncherUpdateState::Cancelled)
+        footer[hintCount++]={"A","Retry",FA_NONE};
+      else if(snapshot.state==LauncherUpdateState::Installed)
+        footer[hintCount++]={"A","Exit Drastic DS",FA_NONE};
+      if(snapshot.state!=LauncherUpdateState::Installed)
+        footer[hintCount++]={"B","Back",FA_NONE};
+      if(maxScroll>0){
+        footer[hintCount++]={"Up / Down","Scroll",FA_NONE};
+        // The deliberate glyph pair: two shoulder glyphs sharing one caption.
+        // "L / R" as a single token has no glyph and no button mapping, so it
+        // would draw a text keycap that no tap could ever press.
+        footer[hintCount++]={"L","",FA_NONE};
+        footer[hintCount++]={"R","Page",FA_NONE};
+      }
+      drawFooterHints(footer,hintCount,panelY+panelHeight-38);
     }
     drawFadeIn();
     presentUi();
@@ -5774,19 +6283,26 @@ static void drawUpdateNotification() {
     g_updateNoticeTag.clear();
     return;
   }
-  const int width=std::min(540,SW-40),height=92,x=SW-width-24,y=SH-height-58;
-  glassPanel(x,y,width,height);
-  border(x,y,width,height,2,COL_SEL);
+  // Under the page header rather than above the footer: the footer now paints
+  // an opaque band, and in portrait the eight-item library footer wraps to two
+  // rows and covered this notice entirely.
+  const int width=std::min(g_launcherPortrait?SW-40:620,SW-32);
+  const int height=g_launcherPortrait?108:92;
+  const int x=(SW-width)/2,y=topBarH()+16;
+  roundedPanel(x,y,width,height,COL_PANEL,COL_SEL);
   const std::string title="Drastic DS "+g_updateNoticeTag+" is available";
-  drawText(g_font,x+22,y+16,ellipsizedText(g_font,title,width-44).c_str(),COL_VAL);
-  drawText(g_font_sm,x+22,y+54,"Open Settings > Launcher > Check for Updates",COL_TXT);
+  drawTextC(g_font,SW/2,y+16,fittedText(g_font,title,width-44).c_str(),COL_VAL);
+  drawTextC(g_font_sm,SW/2,y+height-fontHeight(g_font_sm)-16,
+            "Settings > Launcher > Check for Updates",COL_DIM);
 }
 
 static void gameSourcesScreen() {
   int sel=0,top=0;
+  beginScreenFx();   // clears the caller's footer hit rects before the first poll
   for(;;){
-    const int rowHeight=g_launcherPortrait?settingsRowH():50;
-    const int startY=g_launcherPortrait?settingsListY():112;
+    const int rowHeight=settingsRowH()+6;
+    const int startY=settingsListY();
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     auto sources=loadGameSources(); int n=1+(int)sources.size();
     int vis=std::max(1,(SH-startY-settingsFooterReserve())/rowHeight);
     sel=std::max(0,std::min(sel,n-1)); if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1;
@@ -5799,7 +6315,8 @@ static void gameSourcesScreen() {
         if(touchScrollList(touch,sel,top,n,vis)) continue;
         if(touch==TOUCH_TAP){
           if(ty>=SH-48) return;
-          for(int row=0;row<vis&&top+row<n;row++){ int y=startY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
+          if(tx>=colX&&tx<colX+colW)
+            for(int row=0;row<vis&&top+row<n;row++){ int y=startY+row*rowHeight; if(ty>=y&&ty<y+rowHeight-4){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
           continue;
         }
         if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
@@ -5843,18 +6360,26 @@ static void gameSourcesScreen() {
       }
       if(rebuild) break;
       clearUiBackground();
-      drawHeader("Game folders","All folders are scanned by Drastic DS");
+      drawHeader(LauncherLocalization::Translate("Game folders").data(),
+                 LauncherLocalization::Translate("All folders are scanned by Drastic DS").data());
+      glassPanel(colX-12,startY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
       for(int row=0;row<vis&&top+row<n;row++){
         int index=top+row,slotY=startY+row*rowHeight;
-        int y=slotY+(rowHeight-TTF_FontHeight(g_font))/2; bool current=index==sel;
-        if(current){
-          const int rowInset=g_launcherPortrait?portraitRowInset():-3;
-          const int highlightHeight=g_launcherPortrait?rowHeight-rowInset*2:rowHeight-4;
-          fillRect(56,slotY+rowInset,SW-112,highlightHeight,COL_FOCUS);
-          fillRect(56,slotY+rowInset,5,highlightHeight,COL_SEL);
-        }
-        std::string label=index==0?"[ Add game folder ]":sources[index-1];
-        drawText(g_font,82,y,ellipsizedText(g_font,label,SW-170).c_str(),current?COL_VAL:(index==0?COL_HI:COL_TXT));
+        int y=slotY+(rowHeight-fontHeight(g_font))/2; bool current=index==sel;
+        if(current) drawRowHighlight(colX,slotY,colW,rowHeight-4);
+        const std::string label=index==0?
+            std::string(LauncherLocalization::Translate("Add game folder")):sources[index-1];
+        const int width=valX-labelX;
+        // A long folder path scrolls while selected instead of being cut off.
+        if(current) drawScrollTextL(g_font,labelX,y,width,label.c_str(),COL_VAL);
+        else drawText(g_font,labelX,y,ellipsizedText(g_font,label,width).c_str(),
+                      index==0?COL_HI:COL_TXT);
+      }
+      if(n>vis){
+        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+        fillRect(trackX,startY,4,trackHeight,(SDL_Color){40,44,54,255});
+        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+        fillRect(trackX,startY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
       }
       drawFooterText("A  Select       B  Back");
       presentUi(); waitForNextUiFrame();
@@ -5866,7 +6391,7 @@ static void libraryStorageScreen() {
   static int savedSelection=0;
   constexpr int rowCount=4;
   const int rowHeight=g_launcherPortrait?settingsRowH():64;
-  const int startY=g_launcherPortrait?settingsListY():126;
+  const int startY=settingsListY()+40;   // room for the section heading above
   int sel=std::max(0,std::min(savedSelection,rowCount-1));
   auto openRow=[&](){
     if(sel==0) gameSourcesScreen();
@@ -5894,26 +6419,34 @@ static void libraryStorageScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Library & storage",nullptr);
+    drawHeader(LauncherLocalization::Translate("Library & storage").data(),nullptr);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
+    // "Library" here only echoed the page title above it; the group these rows
+    // actually form is where games and covers live.
+    drawSectionHeading("Storage",colX,startY-44,colW);
     glassPanel(colX-12,startY-10,colW+24,rowCount*rowHeight+18);
     const int rowInset=g_launcherPortrait?portraitRowInset():2;
     float target=(float)(startY+sel*rowHeight+rowInset);
     g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
-    fillRect(colX,(int)g_hy,colW,rowHeight-rowInset*2,COL_FOCUS);
-    fillRect(colX,(int)g_hy,5,rowHeight-rowInset*2,COL_SEL);
+    drawRowHighlight(colX,(int)g_hy,colW,rowHeight-rowInset*2);
     auto shares=loadSmbSharesFromStore(); size_t mounted=0;
     for(const auto &share:shares) if(SwitchStorage::IsSmbMounted(share.id)) mounted++;
     size_t folderCount=loadGameSources().size();
-    std::string folderValue=std::to_string(folderCount)+(folderCount==1?" folder":" folders");
-    std::string smbValue=std::to_string(mounted)+" / "+std::to_string(shares.size())+" connected";
+    std::string folderValue=std::to_string(folderCount)+" "+
+        std::string(LauncherLocalization::Translate(folderCount==1?"folder":"folders"));
+    std::string smbValue=std::to_string(mounted)+" / "+std::to_string(shares.size())+" "+
+        std::string(LauncherLocalization::Translate("connected"));
     size_t missing=0;for(const Game &game:g_games)if(!regularFileExists(existingCoverPath(game)))missing++;
-    const std::string coverValue=missing?std::to_string(missing)+" missing":"Complete";
-    const char *labels[rowCount]={"Game folders","File manager","SMB network shares","Download covers"};
+    const std::string coverValue=missing?
+        std::to_string(missing)+" "+std::string(LauncherLocalization::Translate("missing")):
+        std::string(LauncherLocalization::Translate("Complete"));
+    static const char *const labels[rowCount]={"Game folders","File manager",
+                                               "SMB network shares","Download covers"};
     const char *values[rowCount]={folderValue.c_str(),"SD / USB / SMB",smbValue.c_str(),coverValue.c_str()};
     for(int row=0;row<rowCount;row++){
       int slot=startY+row*rowHeight; bool current=row==sel;
-      drawSettingsRowText(labels[row],values[row],slot,colW,labelX,valX,
+      drawSettingsRowText(LauncherLocalization::Translate(labels[row]).data(),values[row],
+                          slot,colW,labelX,valX,
                           current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,
                           false,rowHeight);
     }
@@ -5933,14 +6466,20 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
                         (int)(sizeof(gameOrder)/sizeof(*gameOrder));
   int launcherRow=0,libraryRow=1,framegenRow=2,screenStart=3;
   int n=nscr+(global?screenStart:0),sel=0,top=0;
-  const int rowH=g_launcherPortrait?settingsRowH():58;
-  const int y0=g_launcherPortrait?settingsListY():92;
-  const int sectionGap=g_launcherPortrait?(highResolutionUi()?44:36):34;
-  const int vis=std::max(1,(SH-y0-settingsFooterReserve()-sectionGap)/rowH);
+  int rowH=0,y0=0,sectionGap=0,vis=1;
+  // Recomputed every frame so an orientation or resolution change is picked up.
+  const auto layout=[&](){
+    rowH=settingsRowH();
+    y0=settingsListY()+40;
+    sectionGap=global?56:0;
+    vis=std::max(1,(SH-y0-settingsFooterReserve()-sectionGap)/rowH);
+  };
+  layout();
   auto rowY=[&](int index){ return y0+(index-top)*rowH+(global&&index>=screenStart?sectionGap:0); };
   beginScreenFx();
   for(;;){
     if(!beginUiFrame()) return;
+    layout();
     SDL_Event event; navRepeat();
     while(pollUiEvent(event)){
       pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
@@ -5981,38 +6520,52 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
       if(sel>=top+vis) top=sel-vis+1;
     }
 
+    layout();
     clearUiBackground();
-    drawHeader(global?"Settings":"Game settings",global?nullptr:ctx);
+    drawHeader(LauncherLocalization::Translate(global?"Settings":"Game settings").data(),
+               global?LauncherLocalization::Translate("Global settings").data():ctx);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     int shown=std::min(vis,n);
     if(global){
-      glassPanel(colX-12,y0-10,colW+24,screenStart*rowH+18);
-      glassPanel(colX-12,y0+screenStart*rowH+sectionGap-10,colW+24,(shown-screenStart)*rowH+18);
-    } else glassPanel(colX-12,y0-10,colW+24,shown*rowH+18);
+      const int generalShown=std::min(shown,screenStart);
+      const int emulatorShown=std::max(0,shown-screenStart);
+      drawSectionHeading("General",colX,y0-44,colW);
+      glassPanel(colX-12,y0-8,colW+24,generalShown*rowH+16);
+      const int emulatorY=rowY(screenStart);
+      drawSectionHeading("Emulator",colX,emulatorY-44,colW);
+      glassPanel(colX-12,emulatorY-8,colW+24,emulatorShown*rowH+16);
+    } else {
+      drawSectionHeading("Emulator",colX,y0-44,colW);
+      glassPanel(colX-12,y0-8,colW+24,shown*rowH+16);
+    }
     const int rowInset=g_launcherPortrait?portraitRowInset():2;
     float target=(float)(rowY(sel)+rowInset);
     g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
-    fillRect(colX,(int)g_hy,colW,rowH-rowInset*2,COL_FOCUS);
-    fillRect(colX,(int)g_hy,5,rowH-rowInset*2,COL_SEL);
+    drawRowHighlight(colX,(int)g_hy,colW,rowH-rowInset*2);
     for(int row=0;row<vis&&top+row<n;row++){
       int index=top+row,slot=rowY(index); bool current=index==sel;
       if(global&&index==launcherRow){
         const char *theme=storeGet(g_global,"Wrapper/Theme","animated");
         const char *value=!strcmp(theme,"xmb")?"XMB (PS3)":(!strcmp(theme,"animated")?"Glow":(!strcmp(theme,"classic")?"Classic":(!strcmp(theme,"oled")?"OLED black":"Bubbles")));
-        drawSettingsRowText("Launcher",value,slot,colW,labelX,valX,current,
+        drawSettingsRowText(LauncherLocalization::Translate("Launcher").data(),value,
+                            slot,colW,labelX,valX,current,
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       } else if(global&&index==libraryRow){
-        drawSettingsRowText("Library & storage","games / files / network",slot,colW,labelX,valX,current,
+        drawSettingsRowText(LauncherLocalization::Translate("Library & storage").data(),
+                            "games / files / network",slot,colW,labelX,valX,current,
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       } else if(global&&index==framegenRow){
-        drawSettingsRowText("Frame Generation","LSFG 2x / Vulkan",slot,colW,labelX,valX,current,
+        drawSettingsRowText(LauncherLocalization::Translate("Frame Generation").data(),
+                            "LSFG 2x / Vulkan",slot,colW,labelX,valX,current,
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       } else {
-        drawSettingsRowText(g_screens[order[global?index-screenStart:index]].title,">",slot,colW,labelX,valX,current,
-                            current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
+        drawSettingsRowText(
+            LauncherLocalization::Translate(g_screens[order[global?index-screenStart:index]].title).data(),
+            ">",slot,colW,labelX,valX,current,
+            current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       }
     }
-    if(n>vis){ int trackH=vis*rowH,trackX=colX+colW+16; fillRect(trackX,y0,4,trackH,(SDL_Color){40,44,54,255}); int thumbH=std::max(16,trackH*vis/n),denom=std::max(1,n-vis); fillRect(trackX,y0+(trackH-thumbH)*top/denom,4,thumbH,COL_SEL); }
+    if(n>vis){ int trackH=vis*rowH,trackX=listTrackX(colX,colW); fillRect(trackX,y0,4,trackH,(SDL_Color){40,44,54,255}); int thumbH=std::max(16,trackH*vis/n),denom=std::max(1,n-vis); fillRect(trackX,y0+(trackH-thumbH)*top/denom,4,thumbH,COL_SEL); }
     drawFooterText("A  Open       X  Help       B  Back");
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
@@ -6029,9 +6582,11 @@ static void drawPendingToast() {
   if(SDL_TICKS_PASSED(SDL_GetTicks(),g_toastUntil)){
     g_toastMessage.clear();g_toastUntil=0;return;
   }
+  // glassPanel's own rim replaces the old square outer border.
   const int pw=std::min(820,SW-64),ph=120,px=(SW-pw)/2,py=(SH-ph)/2;
-  glassPanel(px,py,pw,ph);border(px,py,pw,ph,2,COL_HI);
-  drawTextC(g_font,SW/2,py+46,fittedText(g_font,g_toastMessage,pw-48).c_str(),COL_TXT);
+  glassPanel(px,py,pw,ph);
+  drawTextC(g_font,SW/2,py+(ph-fontHeight(g_font))/2,
+            fittedText(g_font,g_toastMessage,pw-48).c_str(),COL_TXT);
 }
 
 static std::vector<std::string> wrapDialogLines(const std::vector<std::string> &lines,
@@ -6061,12 +6616,45 @@ static std::vector<std::string> wrapDialogLines(const std::vector<std::string> &
   return wrapped;
 }
 
+// Busy / status screens used to float centred text on the bare background, which
+// read like a debug overlay.  They all sit on the same glass panel now, sized to
+// the wrapped text.
+// Boot progress: the launcher cannot pump events yet, so this just paints the
+// logo and the current step and presents it.
+static void bootStatus(const char *step){
+  clearUiBackground();
+  if(g_logo){
+    const int logoH=150,logoW=logoH*16/9;
+    SDL_Rect dst={(SW-logoW)/2,SH/2-logoH,logoW,logoH};
+    SDL_RenderCopy(g_ren,g_logo,nullptr,&dst);
+  }
+  drawTextC(g_font,SW/2,SH/2+40,
+            LauncherLocalization::Translate(step).data(),COL_TXT);
+  presentUi();
+}
+
+static void drawStatusPanel(const std::string &text){
+  const int panelWidth=std::min(940,SW-64),lineHeight=fontHeight(g_font)+8;
+  const std::vector<std::string> lines=wrapDialogLines({text},panelWidth-64);
+  const int panelHeight=std::max(140,(int)lines.size()*lineHeight+64);
+  glassPanel((SW-panelWidth)/2,(SH-panelHeight)/2,panelWidth,panelHeight);
+  int y=(SH-(int)lines.size()*lineHeight)/2;
+  for(const std::string &line:lines){
+    drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
+    y+=lineHeight;
+  }
+}
+
 static void modalMessage(const char *title, const std::vector<std::string> &lines) {
-  const int pw=SW*3/4;
-  const std::vector<std::string> displayLines=wrapDialogLines(lines,pw-64);
-  const int lineHeight=40;
-  const int ph=std::min(SH-64,180+(int)displayLines.size()*lineHeight);
+  const int pw=std::min(SW-32,g_launcherPortrait?SW-40:SW*3/4);
+  const std::vector<std::string> displayLines=wrapDialogLines(lines,pw-56);
+  const int lineHeight=fontHeight(g_font)+12;
+  const int ph=std::min(SH-32,150+(int)displayLines.size()*lineHeight);
   const int px=(SW-pw)/2,py=(SH-ph)/2;
+  // Events are polled before this frame's clearUiBackground() runs, so drop the
+  // caller's footer hit rects now: otherwise a tap in the empty band under the
+  // dialog would synthesise whatever button the *previous* screen had there.
+  g_footN=0;
   for (;;) {
     if(!beginUiFrame()) return;
     SDL_Event e;
@@ -6079,26 +6667,33 @@ static void modalMessage(const char *title, const std::vector<std::string> &line
     }
     clearUiBackground();
     glassPanel(px,py,pw,ph);
-    border(px,py,pw,ph,3,COL_SEL);
-    drawTextC(g_font_big, SW/2, py+34,
-              fittedText(g_font_big,title,pw-48).c_str(),COL_SEL);
-    int y = py+108;
+    drawText(g_font_big,px+28,py+22,
+             fittedText(g_font_big,title?title:"",pw-48).c_str(),COL_TXT);
+    fillRect(px+28,py+72,pw-56,1,(SDL_Color){255,255,255,24});
+    int y = py+88;
+    SDL_Rect clip={px+18,y-4,pw-36,std::max(1,py+ph-58-y)};
+    SDL_RenderSetClipRect(g_ren,&clip);
     for (const std::string &line : displayLines) {
-      if(y+TTF_FontHeight(g_font)>=py+ph-54) break;
       drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
       y+=lineHeight;
     }
-    drawFooterText("A  Continue",py+ph-30);
+    SDL_RenderSetClipRect(g_ren,nullptr);
+    FootItem footer[]={{"A","Continue",FA_NONE}};
+    drawFooterHints(footer,1,py+ph-30);
       presentUi(); waitForNextUiFrame();
   }
 }
 
 static bool confirmBox(const char *title, const std::vector<std::string> &lines) {
-  int pw=SW*3/4;
-  const std::vector<std::string> displayLines=wrapDialogLines(lines,pw-64);
-  int ph=std::min(SH-64,220+(int)displayLines.size()*40),px=(SW-pw)/2,py=(SH-ph)/2;
+  const int pw=std::min(SW-32,g_launcherPortrait?SW-40:SW*3/4);
+  const std::vector<std::string> displayLines=wrapDialogLines(lines,pw-56);
+  const int lineStep=fontHeight(g_font)+12;
+  int ph=std::min(SH-32,190+(int)displayLines.size()*lineStep),px=(SW-pw)/2,py=(SH-ph)/2;
   int bw=std::min(210,(pw-54)/2),bh=56,bby=py+ph-bh-22;
   int yesx=SW/2-bw-12,nox=SW/2+12;
+  // Same as modalMessage: without this a stale footer hit rect inherited from
+  // the calling screen could synthesise an A press and auto-answer "Yes".
+  g_footN=0;
   for(;;){
     if(!beginUiFrame()) return false;
     SDL_Event e;
@@ -6116,22 +6711,27 @@ static bool confirmBox(const char *title, const std::vector<std::string> &lines)
     }
     clearUiBackground();
     glassPanel(px,py,pw,ph);
-    border(px,py,pw,ph,3,(SDL_Color){210,70,70,255});
-    drawTextC(g_font_big,SW/2,py+34,
-              fittedText(g_font_big,title,pw-48).c_str(),
-              (SDL_Color){235,120,120,255});
-    int y=py+112;
+    drawText(g_font_big,px+28,py+22,
+             fittedText(g_font_big,title?title:"",pw-48).c_str(),
+             (SDL_Color){238,135,135,255});
+    fillRect(px+28,py+72,pw-56,1,(SDL_Color){255,255,255,24});
+    int y=py+88;
+    SDL_Rect clip={px+18,y-4,pw-36,std::max(1,bby-y-10)};
+    SDL_RenderSetClipRect(g_ren,&clip);
     for(const std::string &line:displayLines){
-      if(y+40>=bby-8) break;
       drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
-      y+=40;
+      y+=lineStep;
     }
-    fillRect(yesx,bby,bw,bh,(SDL_Color){150,50,50,255}); border(yesx,bby,bw,bh,2,(SDL_Color){215,95,95,255});
-    int yesHintWidth=footerHintWidth("A","Yes");
-    drawButtonHint(yesx+(bw-yesHintWidth)/2,bby+bh/2,"A","Yes");
-    fillRect(nox,bby,bw,bh,(SDL_Color){48,54,64,255}); border(nox,bby,bw,bh,2,COL_DIM);
-    int noHintWidth=footerHintWidth("B","No");
-    drawButtonHint(nox+(bw-noHintWidth)/2,bby+bh/2,"B","No");
+    SDL_RenderSetClipRect(g_ren,nullptr);
+    // drawButtonHint/footerHintWidth localize the label themselves.
+    // Both keep their own face (destructive red / neutral focus) but pick up the
+    // shared button rim and radius.
+    roundedPanel(yesx,bby,bw,bh,(SDL_Color){115,44,51,255},(SDL_Color){255,255,255,28},6);
+    const int yesHintWidth=footerHintWidth("A","Yes");
+    drawButtonHint(yesx+(bw-yesHintWidth)/2,bby+bh/2,"A","Yes",true);
+    roundedPanel(nox,bby,bw,bh,COL_FOCUS,(SDL_Color){255,255,255,28},6);
+    const int noHintWidth=footerHintWidth("B","No");
+    drawButtonHint(nox+(bw-noHintWidth)/2,bby+bh/2,"B","No",true);
       presentUi(); waitForNextUiFrame();
   }
 }
@@ -6192,9 +6792,15 @@ static void drawWrapped(TTF_Font *font,int x,int y,int maxWidth,int lineHeight,i
 
 static SDL_Texture *loadScaledTexture(const std::string &path,int width,int height) {
   if(width<1||height<1) return nullptr;
+  // Callers size in 720p logical units, but this is a *decode* target: sizing
+  // it in logical units would decode covers and icons at 2/3 resolution when
+  // docked and then upscale them.  Draw rects stay in logical units.
+  const int pixelWidth=std::max(1,(int)std::lround(width*g_uiScale));
+  const int pixelHeight=std::max(1,(int)std::lround(height*g_uiScale));
   SDL_Surface *source=IMG_Load(path.c_str());
   if(!source) return nullptr;
-  SDL_Surface *scaled=SDL_CreateRGBSurfaceWithFormat(0,width,height,32,SDL_PIXELFORMAT_RGBA32);
+  SDL_Surface *scaled=SDL_CreateRGBSurfaceWithFormat(0,pixelWidth,pixelHeight,32,
+                                                     SDL_PIXELFORMAT_RGBA32);
   if(!scaled){ SDL_FreeSurface(source); return nullptr; }
   SDL_BlendMode blend=SDL_BLENDMODE_NONE;
   SDL_GetSurfaceBlendMode(source,&blend);
@@ -6218,19 +6824,12 @@ static const char *gridDbErrorText(int result) {
 
 static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const char *gameName) {
   if(artworks.empty()) return -1;
-  const int rowHeight=52;
-  const int listX=g_launcherPortrait?48:56;
-  const int listWidth=g_launcherPortrait?SW-96:SW/2-78;
-  const int previewX=g_launcherPortrait?48:SW/2+28;
-  const int previewAreaWidth=g_launcherPortrait?SW-96:SW-previewX-56;
-  const int portraitPreviewLimit=highResolutionUi()?720:510;
-  const int previewHeight=g_launcherPortrait?
-      std::min(portraitPreviewLimit,(previewAreaWidth*3)/2):
-      std::min(SH-210,highResolutionUi()?720:510);
-  const int previewWidth=previewHeight*2/3;
-  const int previewY=g_launcherPortrait?topBarH()+20:116;
-  const int startY=g_launcherPortrait?previewY+previewHeight+30:116;
-  const int visible=std::max(1,(SH-startY-settingsFooterReserve())/rowHeight);
+  const GameDetailLayout layout=gameDetailLayout();
+  const int rowHeight=settingsRowH()+8;
+  const int listX=layout.content.x,listWidth=layout.content.w;
+  const int startY=layout.content.y+44;
+  const int previewWidth=layout.preview.w,previewHeight=layout.preview.h;
+  const int visible=std::max(1,(layout.content.h-52)/rowHeight);
   const std::string temporary=std::string(COVERS_DIR)+"/.sgdb-preview.img";
   int sel=0,top=0,loaded=-1;
   SDL_Texture *preview=nullptr;
@@ -6238,9 +6837,11 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
   auto releasePreview=[&](){ if(preview) SDL_DestroyTexture(preview); preview=nullptr; remove(temporary.c_str()); };
   auto loadPreview=[&](int index){
     releasePreview(); loaded=index; previewFailed=false;
-    clearUiBackground(); drawHeader("Choose cover artwork",gameName);
-    drawTextC(g_font,previewX+previewAreaWidth/2,
-              previewY+previewHeight/2-18,"Loading preview...",COL_DIM);
+    clearUiBackground(); drawHeader(LauncherLocalization::Translate("Choose cover artwork").data(),gameName);
+    // The download below blocks, so this frame is what the user looks at for
+    // the whole fetch: it gets the same glass panel as every other busy screen
+    // instead of one line of dim text floating on the background.
+    drawStatusPanel(std::string(LauncherLocalization::Translate("Loading preview...")));
     presentUi();
     const std::string &url=artworks[index].thumbnailUrl.empty()?artworks[index].url:artworks[index].thumbnailUrl;
     if(griddb_download_image(url,temporary)==GRIDDB_OK) preview=loadScaledTexture(temporary,previewWidth,previewHeight);
@@ -6260,7 +6861,7 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
           int itemY=startY+row*rowHeight;
           if(ty>=itemY&&ty<itemY+rowHeight){ sel=top+row; if(loaded!=sel) loadPreview(sel); break; }
         }
-        continue;
+        continue; // hit test uses the same startY/rowHeight the rows are drawn at
       }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
       int previous=sel;
@@ -6272,24 +6873,28 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
       if(sel>=top+visible) top=sel-visible+1;
       if(sel!=previous) loadPreview(sel);
     }
-    clearUiBackground(); drawHeader("Choose cover artwork",gameName);
-    glassPanel(listX-10,startY-10,listWidth+20,std::min(visible,(int)artworks.size())*rowHeight+18);
+    clearUiBackground(); drawHeader(LauncherLocalization::Translate("Choose cover artwork").data(),gameName);
+    drawSectionHeading("Online artwork",listX,startY-44,listWidth);
+    glassPanel(listX-8,startY-8,listWidth+16,std::min(visible,(int)artworks.size())*rowHeight+16);
     for(int row=0;row<visible&&top+row<(int)artworks.size();row++){
-      int index=top+row,itemY=startY+row*rowHeight,textY=itemY+(rowHeight-TTF_FontHeight(g_font))/2; bool current=index==sel;
-      if(current){ fillRect(listX,itemY,listWidth,rowHeight-3,COL_FOCUS); fillRect(listX,itemY,5,rowHeight-3,COL_SEL); }
+      int index=top+row,itemY=startY+row*rowHeight,textY=itemY+(rowHeight-fontHeight(g_font))/2; bool current=index==sel;
+      if(current) drawRowHighlight(listX,itemY,listWidth,rowHeight-3);
       std::string label="Artwork "+std::to_string(index+1);
       drawText(g_font,listX+26,textY,label.c_str(),current?COL_VAL:COL_TXT);
       if(artworks[index].width>0&&artworks[index].height>0){
         std::string dimensions=std::to_string(artworks[index].width)+"x"+std::to_string(artworks[index].height);
-        drawTextR(g_font_sm,listX+listWidth-20,textY+(TTF_FontHeight(g_font)-TTF_FontHeight(g_font_sm))/2,dimensions.c_str(),current?COL_VAL:COL_DIM);
+        drawTextR(g_font_sm,listX+listWidth-20,textY+(fontHeight(g_font)-fontHeight(g_font_sm))/2,dimensions.c_str(),current?COL_VAL:COL_DIM);
       }
     }
-    int imageX=previewX+(previewAreaWidth-previewWidth)/2,imageY=previewY;
-    fillRect(imageX,imageY,previewWidth,previewHeight,COL_CARD);
-    if(loaded==sel&&preview){ SDL_Rect destination={imageX,imageY,previewWidth,previewHeight}; SDL_RenderCopy(g_ren,preview,nullptr,&destination); }
-    else if(loaded==sel&&previewFailed) drawTextC(g_font_sm,imageX+previewWidth/2,imageY+previewHeight/2,"Preview unavailable",COL_DIM);
-    border(imageX,imageY,previewWidth,previewHeight,2,loaded==sel?COL_SEL:COL_DIM);
-    drawFooterText("A  Use artwork       B  Back");
+    drawArtworkPreview(loaded==sel?preview:nullptr,layout.preview);
+    if(loaded==sel&&previewFailed){
+      const SDL_Rect &rect=layout.preview;
+      fillRect(rect.x,rect.y,rect.w,rect.h,COL_CARD);
+      drawWrapped(g_font_sm,rect.x+16,rect.y+rect.h/2-30,rect.w-32,fontHeight(g_font_sm)+6,3,
+                  LauncherLocalization::Translate("Preview unavailable").data(),COL_DIM);
+    }
+    FootItem footer[]={{"A","Use artwork",FA_NONE},{"B","Back",FA_NONE}};
+    drawFooterHints(footer,2,SH-26);
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
 }
@@ -6342,8 +6947,9 @@ static bool runCoverImportTask(const char *title,const std::string &detail,
   beginScreenFx();while(!complete.load(std::memory_order_acquire)){
     if(!beginUiFrame()){cancel.store(true);break;}SDL_Event event;while(pollUiEvent(event)){pumpStick(event);int x=0,y=0;
       if((event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL)||(touchFeed(event,&x,&y)==TOUCH_TAP&&y>=SH-80))cancel.store(true);}
-    clearUiBackground();drawHeader(LauncherLocalization::Translate(title).data(),nullptr);drawTextC(g_font,SW/2,SH/2-10,detail.c_str(),COL_TXT);
-    const std::string back=LauncherLocalization::Translate("Cancel").data();FootItem footer[]={{"B",back.c_str(),FA_NONE}};drawFooterHints(footer,1,SH-26);presentUi();waitForNextUiFrame();}
+    clearUiBackground();drawHeader(LauncherLocalization::Translate(title).data(),nullptr);
+    drawStatusPanel(detail);
+    FootItem footer[]={{"B","Cancel",FA_NONE}};drawFooterHints(footer,1,SH-26);presentUi();waitForNextUiFrame();}
   if(worker.joinable())worker.join();
   return !cancel.load();
 }
@@ -6375,26 +6981,46 @@ static void importCoverFromFile(Game &g){
 }
 
 static void coverSettings(Game &g){
-  int selection=0;const bool portrait=g_launcherPortrait;const int margin=portrait?36:70,gap=portrait?24:30,cardsTop=topBarH()+40,cardsBottom=SH-settingsFooterReserve();SDL_Rect cards[2];
-  if(portrait){const int height=(cardsBottom-cardsTop-gap)/2;cards[0]={margin,cardsTop,SW-margin*2,height};cards[1]={margin,cardsTop+height+gap,SW-margin*2,height};}
-  else{const int width=(SW-margin*2-gap)/2;cards[0]={margin,cardsTop,width,cardsBottom-cardsTop};cards[1]={margin+width+gap,cardsTop,width,cardsBottom-cardsTop};}
+  int selection=0;const GameDetailLayout layout=gameDetailLayout();
+  const int gap=20,cardHeight=(layout.content.h-gap)/2;
+  const SDL_Rect cards[2]={{layout.content.x,layout.content.y,layout.content.w,cardHeight},
+    {layout.content.x,layout.content.y+cardHeight+gap,layout.content.w,cardHeight}};
   const char *titles[2]={"Download from SteamGridDB","Import cover from file"};const char *kinds[2]={"Online artwork","Local image"};
   const char *descriptions[2]={"Search SteamGridDB and replace this game's custom cover with selected online artwork.","Choose a PNG, JPEG, WebP or BMP image from SD, USB or SMB storage. It is validated and saved safely as PNG."};
   const auto inside=[](const SDL_Rect&r,int x,int y){return x>=r.x&&x<r.x+r.w&&y>=r.y&&y<r.y+r.h;};
   const auto removeCustom=[&]{const std::string path=existingCoverPath(g);if(!regularFileExists(path)||!confirmBox(LauncherLocalization::Translate("Remove custom cover?").data(),{std::string(LauncherLocalization::Translate("The downloaded or imported cover will be deleted.")),std::string(LauncherLocalization::Translate("The launcher will use the game's embedded artwork when available."))}))return;
     if(remove(path.c_str())!=0&&errno!=ENOENT)modalMessage(LauncherLocalization::Translate("Cover removal failed").data(),{strerror(errno)});else{if(path!=coverPath(g))remove(coverPath(g).c_str());fsdevCommitDevice("sdmc");reloadCover(g);toast(LauncherLocalization::Translate("Custom cover removed").data());}};
-  beginScreenFx();for(;;){if(!beginUiFrame())return;const bool hasCustom=regularFileExists(existingCoverPath(g));SDL_Event event;navRepeat();
+  // Hoisted out of the frame loop: this used to stat the cover file every frame.
+  bool hasCustom=regularFileExists(existingCoverPath(g));
+  beginScreenFx();for(;;){
+    if(!beginUiFrame())return;
+    SDL_Event event;navRepeat();
     while(pollUiEvent(event)){pumpStick(event);int tx=0,ty=0;TouchKind touch=touchFeed(event,&tx,&ty);bool choose=false;
       if(touch==TOUCH_TAP){if(inside(cards[0],tx,ty)){selection=0;choose=true;}else if(inside(cards[1],tx,ty)){selection=1;choose=true;}else if(ty>=SH-40)return;}
-      if(event.type==SDL_CONTROLLERBUTTONDOWN){if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT||event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP)selection=0;else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT||event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN)selection=1;
-        else if(event.cbutton.button==BTN_CONFIRM)choose=true;else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&hasCustom){removeCustom();beginScreenFx();}else if(event.cbutton.button==BTN_CANCEL)return;}
-      if(choose){if(selection==0)downloadCover(g);else importCoverFromFile(g);beginScreenFx();}}
-    clearUiBackground();drawHeader(LauncherLocalization::Translate("Cover settings").data(),g.title.c_str());for(int index=0;index<2;index++){const SDL_Rect&card=cards[index];const bool current=index==selection;
-      fillRect(card.x+5,card.y+7,card.w,card.h,(SDL_Color){0,0,0,62});fillRect(card.x,card.y,card.w,card.h,current?COL_FOCUS:COL_CARD);border(card.x,card.y,card.w,card.h,current?4:2,current?COL_SEL:COL_DIM);if(current)fillRect(card.x,card.y,8,card.h,COL_SEL);
-      const std::string title=LauncherLocalization::Translate(titles[index]).data();drawTextC(g_font_big,card.x+card.w/2,card.y+34,fittedText(g_font_big,title,card.w-60).c_str(),current?COL_VAL:COL_TXT);
-      drawTextC(g_font,card.x+card.w/2,card.y+(portrait?92:126),LauncherLocalization::Translate(kinds[index]).data(),current?COL_HI:COL_DIM);drawWrapped(g_font_sm,card.x+38,card.y+(portrait?148:194),card.w-76,TTF_FontHeight(g_font_sm)+7,portrait?4:5,LauncherLocalization::Translate(descriptions[index]).data(),current?COL_TXT:COL_DIM);}
-    const std::string choose=LauncherLocalization::Translate("Choose").data(),removeLabel=LauncherLocalization::Translate("Remove custom cover").data(),back=LauncherLocalization::Translate("Back").data();
-    if(hasCustom){FootItem footer[]={{"A",choose.c_str(),FA_NONE},{"Y",removeLabel.c_str(),FA_NONE},{"B",back.c_str(),FA_NONE}};drawFooterHints(footer,3,SH-26);}else{FootItem footer[]={{"A",choose.c_str(),FA_NONE},{"B",back.c_str(),FA_NONE}};drawFooterHints(footer,2,SH-26);}drawFadeIn();presentUi();waitForNextUiFrame();}
+      if(event.type==SDL_CONTROLLERBUTTONDOWN){if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT||event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP)selection=0;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT||event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN)selection=1;
+        else if(event.cbutton.button==BTN_CONFIRM)choose=true;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&hasCustom){removeCustom();hasCustom=regularFileExists(existingCoverPath(g));beginScreenFx();}
+        else if(event.cbutton.button==BTN_CANCEL)return;}
+      if(choose){if(selection==0)downloadCover(g);else importCoverFromFile(g);hasCustom=regularFileExists(existingCoverPath(g));beginScreenFx();}}
+    clearUiBackground();drawHeader(LauncherLocalization::Translate("Cover settings").data(),g.title.c_str());
+    drawGamePreview(g,layout.preview);
+    for(int index=0;index<2;index++){
+      const SDL_Rect &card=cards[index];const bool current=index==selection;
+      // Selection is the panel's own rim, matching the artwork preview beside it.
+      if(current)roundedPanel(card.x,card.y,card.w,card.h,COL_PANEL,COL_SEL);
+      else glassPanel(card.x,card.y,card.w,card.h);
+      if(current)drawRowHighlight(card.x+8,card.y+8,card.w-16,card.h-16);
+      const int x=card.x+28,width=card.w-56;
+      drawText(g_font_sm,x,card.y+24,LauncherLocalization::Translate(kinds[index]).data(),COL_HI);
+      const std::string title(LauncherLocalization::Translate(titles[index]));
+      drawScrollTextL(g_font,x,card.y+62,width,title.c_str(),current?COL_VAL:COL_TXT);
+      drawWrapped(g_font_sm,x,card.y+112,width,fontHeight(g_font_sm)+7,
+        std::max(1,(card.h-132)/(fontHeight(g_font_sm)+7)),
+        LauncherLocalization::Translate(descriptions[index]).data(),COL_DIM);
+    }
+    if(hasCustom){FootItem footer[]={{"A","Choose",FA_NONE},{"Y","Remove custom cover",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,3,SH-26);}else{FootItem footer[]={{"A","Choose",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,SH-26);}
+    drawFadeIn();presentUi();waitForNextUiFrame();}
 }
 
 static void downloadAllCovers() {
@@ -6426,13 +7052,14 @@ static void downloadAllCovers() {
     if(!beginUiFrame()){cancel=true;break;}
     SDL_Event event;while(pollUiEvent(event)){pumpStick(event);if(event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL)cancel=true;int tx=0,ty=0;if(touchFeed(event,&tx,&ty)==TOUCH_TAP&&ty>=SH-90)cancel=true;}
     std::string title;{std::lock_guard<std::mutex> lock(progressMutex);title=currentTitle;}
-    clearUiBackground();drawHeader("Download covers",nullptr);
+    clearUiBackground();drawHeader(LauncherLocalization::Translate("Download covers").data(),nullptr);
+    glassPanel(80,SH/2-128,SW-160,252);
     drawTextC(g_font,SW/2,SH/2-96,("Downloading  "+std::to_string(std::min(total,done.load()+1))+" / "+std::to_string(total)).c_str(),COL_VAL);
     drawTitleCell(SW/2,SW-260,SH/2-44,title,true,COL_TXT);
-    int width=SW-360,x=180,y=SH/2+16,height=26;fillRect(x,y,width,height,(SDL_Color){40,44,54,255});border(x,y,width,height,2,COL_DIM);
-    fillRect(x,y,total?width*done.load()/total:0,height,COL_SEL);
+    const int width=SW-240,x=120,y=SH/2+16,height=26;
+    drawProgressBar(x,y,width,height,total?(double)done.load()/total:0.0);
     char status[64];snprintf(status,sizeof(status),"%d downloaded    %d failed",ok.load(),fail.load());drawTextC(g_font_sm,SW/2,y+46,status,COL_DIM);
-    FootItem footer[]={{"B","Cancel",FA_NONE}};drawFooterHints(footer,1,SH-24);presentUi();waitForNextUiFrame();
+    FootItem footer[]={{"B","Cancel",FA_NONE}};drawFooterHints(footer,1,SH-26);presentUi();waitForNextUiFrame();
   }
   cancel=true;if(worker.joinable())worker.join();
   // Only invalidate successful entries here. The cover worker decodes them
@@ -6451,19 +7078,21 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
   std::string key = storeGet(g_global,"Wrapper/SteamGridDBKey","");
   if(!key.empty()){
     clearUiBackground();
-    drawHeader("Choose an icon", g.title.c_str());
-    drawTextC(g_font, SW/2, SH/2, "Fetching icons from SteamGridDB...", COL_TXT);
+    drawHeader(LauncherLocalization::Translate("Choose an icon").data(), g.title.c_str());
+    drawStatusPanel(LauncherLocalization::Translate("Fetching icons from SteamGridDB...").data());
     presentUi();
     int nf=griddb_fetch_icons(key,g.title,tmp,14);
     for(int i=0;i<nf;i++){ char p[300]; snprintf(p,sizeof(p),"%s/gicon_%d.png",tmp.c_str(),i); paths.push_back(p); }
   }
   if(paths.empty()){ toast("No icon found - add a SteamGridDB key or download a cover first",1800); return false; }
   int n=(int)paths.size();
-  int cols=n<5?n:5; if(cols<1)cols=1;
-  int rows=(n+cols-1)/cols, gap=18, top=150, bot=40;
-  int cw=(SW-80-(cols-1)*gap)/cols, ch=(SH-top-bot-(rows-1)*gap)/rows;
+  const int maxCols=g_launcherPortrait?3:5;
+  int cols=n<maxCols?n:maxCols; if(cols<1)cols=1;
+  int rows=(n+cols-1)/cols, gap=18, top=topBarH()+32, bot=SH-settingsFooterReserve()-12;
+  int cw=(SW-80-(cols-1)*gap)/cols, ch=(bot-top-(rows-1)*gap)/rows;
   int cell=cw<ch?cw:ch; if(cell>200)cell=200; if(cell<90)cell=90;
-  int x0=(SW-(cols*cell+(cols-1)*gap))/2, y0=top;
+  const int gridH=rows*cell+(rows-1)*gap;
+  int x0=(SW-(cols*cell+(cols-1)*gap))/2, y0=top+std::max(0,(bot-top-gridH)/2);
   std::vector<SDL_Texture*> tex(n,nullptr);
   for(int i=0;i<n;i++) tex[i]=loadScaledTexture(paths[i],cell,cell);
   int sel=0, chosen=-1; bool done=false; beginScreenFx();
@@ -6491,13 +7120,16 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
       }
     }
     clearUiBackground();
-    drawHeader("Choose an icon", g.title.c_str());
+    drawHeader(LauncherLocalization::Translate("Choose an icon").data(), g.title.c_str());
     for(int i=0;i<n;i++){ int r=i/cols,c=i%cols, x=x0+c*(cell+gap), y=y0+r*(cell+gap);
-      if(i==sel) fillRect(x-6,y-6,cell+12,cell+12,COL_SEL);
+      if(i==sel) roundedPanel(x-8,y-8,cell+16,cell+16,COL_PANEL,COL_SEL);
+      else glassPanel(x-8,y-8,cell+16,cell+16);
       fillRect(x,y,cell,cell,COL_CARD);
       if(tex[i]){ SDL_Rect d{x,y,cell,cell}; SDL_RenderCopy(g_ren,tex[i],nullptr,&d); }
       else drawTextC(g_font_sm,x+cell/2,y+cell/2,"?",COL_DIM);
     }
+    { FootItem footer[]={{"A","Use icon",FA_NONE},{"B","Back",FA_NONE}};
+      drawFooterHints(footer,2,SH-26); }
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
   for(auto t:tex) if(t) SDL_DestroyTexture(t);
@@ -6511,17 +7143,20 @@ static void forwarderWizard(Game &g) {
   char icon[300]={0};
   { struct stat st; std::string cp=existingCoverPath(g);
     if(stat(cp.c_str(),&st)==0) snprintf(icon,sizeof(icon),"%s",cp.c_str()); }
-  SDL_Texture *iconTex = icon[0] ? loadScaledTexture(icon,280,280) : nullptr;
-
-  const int isz=g_launcherPortrait?std::min(280,SW-160):280;
-  const int ix=g_launcherPortrait?(SW-isz)/2:110;
-  const int iy=g_launcherPortrait?topBarH()+30:176;
-  const int rx=g_launcherPortrait?56:ix+isz+70;
-  const int rw=g_launcherPortrait?SW-112:SW-rx-90;
-  const int nameY=g_launcherPortrait?iy+isz+62:196;
-  const int authY=g_launcherPortrait?nameY+94:290;
-  const int createY=g_launcherPortrait?authY+116:406;
+  // Shares the game-detail layout with the other three detail screens; the icon
+  // is square, so it is centred inside that layout's cover rect.
+  const GameDetailLayout layout=gameDetailLayout();
+  const int isz=std::min(layout.preview.w,layout.preview.h);
+  // Decoded at the size it is actually drawn at, so the preview is not built
+  // from a guess that can be smaller than the on-screen rect.
+  SDL_Texture *iconTex = icon[0] ? loadScaledTexture(icon,isz,isz) : nullptr;
+  const int ix=layout.preview.x+(layout.preview.w-isz)/2;
+  const int iy=layout.preview.y+(layout.preview.h-isz)/2;
+  const int rx=layout.content.x,rw=layout.content.w;
   const int fieldH=64,createH=58;
+  const int nameY=layout.content.y+44;
+  const int authY=nameY+fieldH+22;
+  const int createY=authY+fieldH+34;
   int sel=0; bool done=false; beginScreenFx();
 
   auto edit=[&](const char *header,char *buffer,size_t size){
@@ -6531,8 +7166,8 @@ static void forwarderWizard(Game &g) {
   auto build=[&](){
     if(!icon[0]){ toast("Pick an icon first",1200); return; }
     clearUiBackground();
-    drawHeader("Creating HOME shortcut", g.title.c_str());
-    drawTextC(g_font, SW/2, SH/2, "Building + installing forwarder...", COL_TXT);
+    drawHeader(LauncherLocalization::Translate("Creating HOME shortcut").data(), g.title.c_str());
+    drawStatusPanel(LauncherLocalization::Translate("Building + installing forwarder...").data());
     presentUi();
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     const std::string &shortcutKey=g.key;
@@ -6561,10 +7196,11 @@ static void forwarderWizard(Game &g) {
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
         if(tk==TOUCH_TAP){
+          const bool inColumn=tx>=rx-10&&tx<rx+rw+10;
           if(tx>=ix&&tx<ix+isz&&ty>=iy&&ty<iy+isz){ sel=0; activate(); }
-          else if(ty>=nameY-6&&ty<nameY+fieldH){ sel=1; activate(); }
-          else if(ty>=authY-6&&ty<authY+fieldH){ sel=2; activate(); }
-          else if(ty>=createY-6&&ty<createY+createH){ sel=3; activate(); }
+          else if(inColumn&&ty>=nameY-6&&ty<nameY-6+fieldH){ sel=1; activate(); }
+          else if(inColumn&&ty>=authY-6&&ty<authY-6+fieldH){ sel=2; activate(); }
+          else if(inColumn&&ty>=createY-6&&ty<createY-6+createH){ sel=3; activate(); }
           else if(ty>=SH-40) done=true;
           continue;
         }
@@ -6580,22 +7216,27 @@ static void forwarderWizard(Game &g) {
       }
     }
     clearUiBackground();
-    drawHeader("Create HOME shortcut", g.title.c_str());
-    if(sel==0) fillRect(ix-6,iy-6,isz+12,isz+12,COL_SEL);
-    fillRect(ix,iy,isz,isz,COL_CARD);
-    if(iconTex){ SDL_Rect d{ix,iy,isz,isz}; SDL_RenderCopy(g_ren,iconTex,nullptr,&d); }
-    else drawTextC(g_font_sm,ix+isz/2,iy+isz/2,"(no icon)",COL_DIM);
-    drawTextC(g_font_sm, ix+isz/2, iy+isz+20, "Icon", sel==0?COL_VAL:COL_DIM);
+    drawHeader(LauncherLocalization::Translate("Create HOME shortcut").data(), g.title.c_str());
+    { SDL_Rect iconRect={ix,iy,isz,isz};
+      drawArtworkPreview(iconTex,iconRect,sel==0); }
+    drawTextC(g_font_sm, ix+isz/2, iy+isz+20,
+              LauncherLocalization::Translate("Icon").data(), sel==0?COL_VAL:COL_DIM);
     auto field=[&](int idx,int y,const char*label,const char*val){ bool cur=sel==idx;
-      if(cur){ fillRect(rx-10,y-6,rw+20,fieldH,COL_FOCUS); fillRect(rx-10,y-6,5,fieldH,COL_SEL); }
-      drawText(g_font_sm, rx, y, label, cur?COL_VAL:COL_DIM);
+      roundedRect(rx-10,y-6,rw+20,fieldH,5,COL_CARD);
+      if(cur) drawRowHighlight(rx-10,y-6,rw+20,fieldH);
+      drawText(g_font_sm, rx, y, LauncherLocalization::Translate(label).data(), cur?COL_VAL:COL_DIM);
       drawScrollTextL(g_font,rx,y+26,rw-8,val,cur?COL_VAL:COL_TXT); };
     field(1,nameY,"Name",name);
     field(2,authY,"Author",author);
     { bool cur=sel==3;
-      fillRect(rx-10,createY-6,rw+20,createH, cur?(SDL_Color){44,86,44,240}:(SDL_Color){30,46,32,200});
-      if(cur) fillRect(rx-10,createY-6,5,createH,COL_SEL);
-      drawTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
+      // The bespoke green palette is dropped: this is an action button like any
+      // other, so it follows the theme's focus/card colours.
+      drawButtonPanel(rx-10,createY-6,rw+20,createH,cur);
+      drawTextC(g_font, rx+rw/2, createY+12,
+                LauncherLocalization::Translate("Create shortcut").data(),
+                cur?COL_VAL:COL_TXT); }
+    { FootItem footer[]={{"A",sel==3?"Create":"Change",FA_NONE},{"B","Back",FA_NONE}};
+      drawFooterHints(footer,2,SH-26); }
     drawFadeIn(); presentUi(); waitForNextUiFrame();
   }
   if(iconTex) SDL_DestroyTexture(iconTex);
@@ -6612,7 +7253,13 @@ static int chooseLibraryAction(const char *title,const std::vector<std::string> 
     while(pollUiEvent(event)){
       pumpStick(event);int tx=0,ty=0;TouchKind touch=touchFeed(event,&tx,&ty);
       if(touchScrollList(touch,selection,top,(int)items.size(),visible))continue;
-      if(touch==TOUCH_TAP){if(ty>=SH-44)return -1;for(int row=0;row<visible&&top+row<(int)items.size();row++)if(ty>=listY+row*rowH&&ty<listY+(row+1)*rowH)return top+row;}
+      if(touch==TOUCH_TAP){
+        if(ty>=SH-44)return -1;
+        int colX,colW,labelX,valX;listCol(&colX,&colW,&labelX,&valX);
+        if(tx>=colX&&tx<colX+colW)
+          for(int row=0;row<visible&&top+row<(int)items.size();row++)
+            if(ty>=listY+row*rowH&&ty<listY+(row+1)*rowH)return top+row;
+      }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN)continue;
       if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP)selection=(selection+(int)items.size()-1)%items.size();
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN)selection=(selection+1)%items.size();
@@ -6621,27 +7268,38 @@ static int chooseLibraryAction(const char *title,const std::vector<std::string> 
       if(selection<top)top=selection;
       if(selection>=top+visible)top=selection-visible+1;
     }
-    clearUiBackground();drawHeader(title,nullptr);
+    clearUiBackground();drawHeader(LauncherLocalization::Translate(title?title:"").data(),nullptr);
     int colX,colW,labelX,valX;listCol(&colX,&colW,&labelX,&valX);
-    glassPanel(colX-12,listY-10,colW+24,visible*rowH+18);
+    glassPanel(colX-12,listY-10,colW+24,
+               std::min(visible,std::max(0,(int)items.size()-top))*rowH+18);
     for(int row=0;row<visible&&top+row<(int)items.size();row++){
-      const int index=top+row,y=listY+row*rowH;if(index==selection){fillRect(colX,y,colW,rowH-2,COL_FOCUS);fillRect(colX,y,5,rowH-2,COL_SEL);}
-      drawText(g_font,labelX,y+(rowH-TTF_FontHeight(g_font))/2,items[index].c_str(),index==selection?COL_VAL:COL_TXT);
+      const int index=top+row,y=listY+row*rowH;if(index==selection) drawRowHighlight(colX,y,colW,rowH-2);
+      const int textY=y+(rowH-fontHeight(g_font))/2,width=valX-labelX;
+      // Long collection and folder names scroll rather than being cut off.
+      if(index==selection) drawScrollTextL(g_font,labelX,textY,width,items[index].c_str(),COL_VAL);
+      else drawText(g_font,labelX,textY,fittedText(g_font,items[index],width).c_str(),COL_TXT);
     }
-    FootItem footer[]={{"A","Choose",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,SH-24);
+    if((int)items.size()>visible){
+      const int trackX=listTrackX(colX,colW),trackHeight=visible*rowH;
+      fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
+      const int thumbHeight=std::max(16,trackHeight*visible/(int)items.size());
+      const int denominator=std::max(1,(int)items.size()-visible);
+      fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
+    }
+    FootItem footer[]={{"A","Choose",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,SH-26);
     drawFadeIn();presentUi();waitForNextUiFrame();
   }
 }
 
 static void manageCollections(){
   for(;;){
-    std::vector<std::string> choices{"New collection..."};for(const Collection &collection:g_collections)choices.push_back(collection.name);
+    std::vector<std::string> choices{uiText("New collection...")};for(const Collection &collection:g_collections)choices.push_back(collection.name);
     const int selected=chooseLibraryAction("Manage collections",choices);if(selected<0)return;
     if(selected==0){char name[96]{};if(promptText("Collection name","",name,sizeof(name))&&!trim(name).empty()){
       const std::string entered=trim(name);const bool duplicate=std::any_of(g_collections.begin(),g_collections.end(),[&](const Collection &c){return !strcasecmp(c.name.c_str(),entered.c_str());});
       if(duplicate)modalMessage("Collection already exists",{entered});else{g_collections.push_back({entered,{}});saveLibraryOrganization();}}
       beginScreenFx();continue;}
-    const int index=selected-1;const int action=chooseLibraryAction(g_collections[index].name.c_str(),{"Rename","Delete collection"});
+    const int index=selected-1;const int action=chooseLibraryAction(g_collections[index].name.c_str(),{uiText("Rename"),uiText("Delete collection")});
     if(action==0){char renamed[96]{};if(promptText("Rename collection",g_collections[index].name.c_str(),renamed,sizeof(renamed))&&!trim(renamed).empty()){
       if(g_activeCollection==g_collections[index].name)g_activeCollection=trim(renamed);
       g_collections[index].name=trim(renamed);saveLibraryOrganization();rebuildLibraryView();}}
@@ -6654,9 +7312,9 @@ static void manageCollections(){
 
 static void organizeGame(Game &game){
   for(;;){
-    std::vector<std::string> choices{"Favorite"+(g_favorites.count(game.key)?std::string("  ✓"):std::string{})};
-    for(const Collection &collection:g_collections)choices.push_back(collection.name+(collection.games.count(game.key)?"  ✓":""));
-    choices.push_back("New collection...");const int selected=chooseLibraryAction("Favorites & collections",choices);if(selected<0)return;
+    std::vector<std::string> choices{uiText("Favorite")+(g_favorites.count(game.key)?std::string("  \xe2\x9c\x93"):std::string{})};
+    for(const Collection &collection:g_collections)choices.push_back(collection.name+(collection.games.count(game.key)?"  \xe2\x9c\x93":""));
+    choices.push_back(uiText("New collection..."));const int selected=chooseLibraryAction("Favorites & collections",choices);if(selected<0)return;
     if(selected==0){if(!g_favorites.erase(game.key))g_favorites.insert(game.key);}
     else if(selected==(int)choices.size()-1){char name[96]{};if(promptText("Collection name","",name,sizeof(name))&&!trim(name).empty())g_collections.push_back({trim(name),{game.key}});}
     else{Collection &collection=g_collections[selected-1];if(!collection.games.erase(game.key))collection.games.insert(game.key);}
@@ -6665,8 +7323,10 @@ static void organizeGame(Game &game){
 }
 
 static void chooseLibraryFilter(){
-  std::vector<std::string> choices{"All games","Favorites"};for(const Collection &collection:g_collections)choices.push_back(collection.name);
-  choices.push_back("Search...");choices.push_back("Manage collections");const int selected=chooseLibraryAction("Filter library",choices);if(selected<0)return;
+  std::vector<std::string> choices{uiText("All games"),uiText("Favorites")};
+  for(const Collection &collection:g_collections)choices.push_back(collection.name);
+  choices.push_back(uiText("Search..."));choices.push_back(uiText("Manage collections"));
+  const int selected=chooseLibraryAction("Filter library",choices);if(selected<0)return;
   if(selected==0){g_activeCollection.clear();g_searchQuery.clear();}
   else if(selected==1){g_activeCollection="favorites";g_searchQuery.clear();}
   else if(selected<2+(int)g_collections.size()){g_activeCollection=g_collections[selected-2].name;g_searchQuery.clear();}
@@ -6675,9 +7335,58 @@ static void chooseLibraryFilter(){
   rebuildLibraryView();beginScreenFx();
 }
 
+// One item table, one layout, shared by the renderer and the tap hit test.
+static const char *GAME_MENU_ITEMS[]={"Launch","Game settings","Rename game","Cover settings",
+  "Favorite / collections","Create HOME shortcut","Clear game settings","Delete game"};
+static constexpr int GAME_MENU_COUNT=(int)(sizeof(GAME_MENU_ITEMS)/sizeof(*GAME_MENU_ITEMS));
+static constexpr int GAME_MENU_MANAGE_START=6;   // first row of the destructive group
+struct GameMenuLayout {
+  GameDetailLayout detail;
+  int start,rowHeight;
+  int rowY(int index)const{
+    return start+index*rowHeight+(index>=GAME_MENU_MANAGE_START?56:0);
+  }
+};
+static GameMenuLayout gameMenuLayout(){
+  const GameDetailLayout detail=gameDetailLayout();
+  const int rowHeight=settingsRowH();
+  const int height=GAME_MENU_COUNT*rowHeight+56+44+8;
+  return {detail,detail.content.y+44+std::max(0,(detail.content.h-height)/2),rowHeight};
+}
+static void drawGameMenu(Game &game,int selection){
+  const GameMenuLayout layout=gameMenuLayout();
+  const SDL_Rect &menu=layout.detail.content;
+  clearUiBackground();
+  drawPageHeader(game.title.c_str(),LauncherLocalization::Translate("Game menu").data(),
+                 game.gameCode.c_str());
+  drawGamePreview(game,layout.detail.preview);
+  drawSectionHeading("General",menu.x,layout.start-44,menu.w);
+  glassPanel(menu.x-8,layout.start-8,menu.w+16,GAME_MENU_MANAGE_START*layout.rowHeight+16);
+  drawSectionHeading("Manage game",menu.x,layout.rowY(GAME_MENU_MANAGE_START)-44,menu.w);
+  glassPanel(menu.x-8,layout.rowY(GAME_MENU_MANAGE_START)-8,menu.w+16,
+             (GAME_MENU_COUNT-GAME_MENU_MANAGE_START)*layout.rowHeight+16);
+  const float target=(float)(layout.rowY(selection)+2);
+  g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+  drawRowHighlight(menu.x,(int)g_hy,menu.w,layout.rowHeight-4);
+  for(int index=0;index<GAME_MENU_COUNT;index++){
+    const bool current=index==selection;
+    const bool submenu=index==1||index==3||index==4||index==5;
+    const SDL_Color color=index==GAME_MENU_COUNT-1?(SDL_Color){238,135,135,255}:
+                          (current?COL_VAL:COL_TXT);
+    drawSettingsRowText(LauncherLocalization::Translate(GAME_MENU_ITEMS[index]).data(),
+                        submenu?">":"",layout.rowY(index),menu.w,
+                        menu.x+24,menu.x+menu.w-24,current,color,
+                        current?COL_VAL:COL_DIM,false,layout.rowHeight);
+  }
+  FootItem footer[]={{"A",selection==0?"Launch":"Select",FA_NONE},{"B","Back",FA_NONE}};
+  drawFooterHints(footer,2,SH-26);
+  drawFadeIn();
+  presentUi();
+}
+
 static int perGameMenu(Game &g, SDL_GameController *pad) {
-  const char *items[] = { "Launch", "Game settings", "Rename game", "Cover settings", "Create HOME shortcut", "Clear game settings", "Favorite / collections", "Delete game" };
-  int n=8, sel=0;
+  const int n=GAME_MENU_COUNT;
+  int sel=0;
   std::string gp = std::string(GAMECFG_DIR) + "/" + g.key + ".ini";
   std::string pathGp = std::string(GAMECFG_DIR) + "/" + g.pathKey + ".ini";
   std::string legacyGp = std::string(GAMECFG_DIR) + "/" + g.legacyKey + ".ini";
@@ -6688,36 +7397,23 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
   normalizeCpuThreads(g_game);
   migrateStylusMode(g_game,false);
   storeRemove(g_game,"Wrapper/CpuBoost");
-  const int coverWidth=g_launcherPortrait?(highResolutionUi()?300:240):300;
-  const int coverHeight=coverWidth*3/2;
-  const int coverX=g_launcherPortrait?(SW-coverWidth)/2:90;
-  const int coverY=g_launcherPortrait?topBarH()+30:(SH-coverHeight)/2;
-  const int menuX=g_launcherPortrait?56:coverX+coverWidth+64;
-  const int menuWidth=g_launcherPortrait?SW-112:SW-menuX-70;
-  const int menuRowH=g_launcherPortrait?(highResolutionUi()?72:62):56;
-  const int menuStartY=g_launcherPortrait?coverY+coverHeight+40:210;
-  // Use one row rectangle for hit testing, the animated selection overlay and
-  // text placement.  The old landscape overlay started six pixels before the
-  // row while the text was centered in the unshifted 56-pixel slot, leaving
-  // the selected label visibly below the overlay's centre.
-  const int menuRowInset=g_launcherPortrait?portraitRowInset():4;
-  const int menuContentH=menuRowH-menuRowInset*2;
-  const auto menuRowTop=[&](int index){
-    return menuStartY+index*menuRowH+menuRowInset;
-  };
   beginScreenFx();
   for(;;){
     if(!beginUiFrame()) return 0;
     SDL_Event e;
     navRepeat();
+    const GameMenuLayout layout=gameMenuLayout();
     while(pollUiEvent(e)){
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
         if(tk==TOUCH_TAP){
           if(ty>=SH-40){ return 0; }
+          if(ty<topBarH()) continue;
+          const SDL_Rect &menuRect=layout.detail.content;
+          if(tx<menuRect.x||tx>=menuRect.x+menuRect.w) continue;
           for(int i=0;i<n;i++){
-            const int hitTop=menuRowTop(i);
-            if(ty>=hitTop && ty<hitTop+menuContentH){ sel=i;
+            const int hitTop=layout.rowY(i);
+            if(ty>=hitTop && ty<hitTop+layout.rowHeight){ sel=i;
             SDL_Event a; memset(&a,0,sizeof(a)); a.type=SDL_CONTROLLERBUTTONDOWN; a.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&a); break; } }
           continue;
         }
@@ -6754,13 +7450,13 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
             }
           }
           else if(sel==3){ coverSettings(g); beginScreenFx(); }
-          else if(sel==4){ forwarderWizard(g); beginScreenFx(); }
-          else if(sel==5){
+          else if(sel==4){ organizeGame(g); beginScreenFx(); }
+          else if(sel==5){ forwarderWizard(g); beginScreenFx(); }
+          else if(sel==6){
             g_game.kv.clear(); remove(gp.c_str());
             if(g.legacyUnique&&!g.legacyKey.empty()) remove(legacyGp.c_str());
             g.hasCfg=false; toast("Game settings cleared",700); beginScreenFx();
           }
-          else if(sel==6){ organizeGame(g); beginScreenFx(); }
           else if(sel==7){
             if(confirmBox("Delete game?", { g.title, "", "This permanently deletes the game file from",
                                             "its storage device. This cannot be undone." })){
@@ -6790,33 +7486,56 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
           break;
       }
     }
-    clearUiBackground();
-    if(g_launcherPortrait) drawHeader("Game menu",g.title.c_str());
-    g_cover_budget = 1;
-    ensureCover(g,true);
-    int cw=coverWidth,chh=coverHeight,cx=coverX,cy=coverY;
-    fillRect(cx+5,cy+7,cw,chh,(SDL_Color){0,0,0,60}); fillRect(cx+2,cy+3,cw,chh,(SDL_Color){0,0,0,75});
-    if(g.cover){ drawGameArtwork(g,cx,cy,cw,chh,255,255); border(cx,cy,cw,chh,2,COL_DIM); }
-    else { fillRect(cx,cy,cw,chh,(SDL_Color){40,44,54,255}); border(cx,cy,cw,chh,2,COL_DIM); drawTextC(g_font,cx+cw/2,cy+chh/2,"NO COVER",COL_DIM); }
-    if(!g_launcherPortrait)
-      drawText(g_font_big,cx+cw+70,120,
-               fittedText(g_font_big,g.title,SW-(cx+cw+140)).c_str(),COL_TXT);
-    int mx=menuX,mw=menuWidth;
-    float ty=(float)menuRowTop(sel);
-    g_hy=(!g_uiAnimations||g_hy<0)?ty:g_hy+(ty-g_hy)*0.30f;
-    fillRect(mx,(int)g_hy,mw,menuContentH,COL_FOCUS);
-    fillRect(mx,(int)g_hy,5,menuContentH,COL_SEL);
-    for(int i=0;i<n;i++){
-      const int y=menuRowTop(i)+(menuContentH-TTF_FontHeight(g_font))/2;
-      bool cur=i==sel;
-      SDL_Color rc = (i==n-1) ? (SDL_Color){228,120,120,255} : COL_TXT;
-      drawText(g_font,mx+30,y,
-               fittedText(g_font,items[i],mw-52).c_str(),cur?COL_VAL:rc);
-    }
-    drawFadeIn();
-    presentUi();
+    drawGameMenu(g,sel);
     waitForNextUiFrame();
   }
+}
+
+// ---------------------------------------------------------------------------
+// First-launch setup progress
+// ---------------------------------------------------------------------------
+// The bundled core, emulator NRO and resources are copied out of romfs on the
+// first launch after an update. The copy stays on the UI thread and repaints
+// between chunks; nothing is drawn until a byte is actually written, so an
+// up-to-date install still launches instantly.
+static long long   g_setupTotal=0,g_setupDone=0;
+static int         g_setupPct=-1;
+static bool        g_setupAborted=false;
+static std::string g_setupDetail;
+
+static void drawSetupProgress(int pct,const char *msg,const char *detail) {
+  clearUiBackground();
+  const int barW=SW*2/3,barX=(SW-barW)/2,barH=36;
+  const bool hasDetail=detail&&*detail;
+  const int barY=SH/2+(hasDetail?56:40);
+  glassPanel(barX-40,SH/2-208,barW+80,400);
+  if(g_logo){ const int size=140; SDL_Rect dst={(SW-size)/2,SH/2-180,size,size}; SDL_RenderCopy(g_ren,g_logo,nullptr,&dst); }
+  drawTextC(g_font,SW/2,SH/2-14,fittedText(g_font,msg?msg:"",barW).c_str(),COL_TXT);
+  if(hasDetail)
+    drawTextC(g_font_sm,SW/2,SH/2+22,fittedText(g_font_sm,detail,barW).c_str(),COL_DIM);
+  drawProgressBar(barX,barY,barW,barH,pct/100.0);
+  char text[16]; snprintf(text,sizeof(text),"%d%%",pct);
+  drawTextC(g_font_sm,SW/2,barY+barH+14,text,COL_DIM);
+  presentUi();
+}
+
+// Repaints only when the whole-percent figure moves.
+static void setupTick(long long bytes) {
+  g_setupDone+=bytes;
+  if(g_setupTotal<=0||g_setupAborted) return;
+  const long long done=std::min(g_setupDone,g_setupTotal);
+  const int pct=(int)(done*100/g_setupTotal);
+  if(pct==g_setupPct) return;
+  g_setupPct=pct;
+  if(!beginUiFrame()){ g_setupAborted=true; return; }
+  SDL_Event event; while(pollUiEvent(event)) pumpStick(event);
+  drawSetupProgress(pct,LauncherLocalization::Translate("Preparing emulator files").data(),
+                    g_setupDetail.c_str());
+}
+
+static long long setupFileBytes(const char *path) {
+  struct stat st{};
+  return stat(path,&st)==0&&S_ISREG(st.st_mode)?(long long)st.st_size:0;
 }
 
 static bool extractFromRomfs(const char *src, const char *dst, bool force=false) {
@@ -6827,7 +7546,11 @@ static bool extractFromRomfs(const char *src, const char *dst, bool force=false)
   FILE *in=fopen(src,"rb"), *out=fopen(tmp.c_str(),"wb");
   if(!in||!out){ if(in)fclose(in); if(out)fclose(out); return false; }
   static char buf[1<<16]; size_t n; bool ok=true;
-  while((n=fread(buf,1,sizeof(buf),in))>0){ if(fwrite(buf,1,n,out)!=n){ ok=false; break; } }
+  while((n=fread(buf,1,sizeof(buf),in))>0){
+    if(fwrite(buf,1,n,out)!=n){ ok=false; break; }
+    setupTick((long long)n);
+    if(g_setupAborted){ ok=false; break; }
+  }
   if(ferror(in)) ok=false;
   if(fflush(out)!=0||fsync(fileno(out))!=0) ok=false;
   if(fclose(in)!=0) ok=false;
@@ -6980,31 +7703,20 @@ static bool ensureEmu(const char *src,const char *dst) {
   return extractFromRomfs(src,dst,true)&&sameNroBuild(src,dst);
 }
 
-static void cleanupLegacyEmuHosts() {
-  static const char *directories[]={DATA_DIR,EMU_HOST_DIR};
-  static const char *filenames[]={"DrasticDS_nx_vk.nro",
-                                  "DrasticDS_nx_gl.nro",
-                                  "DrasticDS_nx_zink.nro"};
-  static const char *suffixes[]={"",".tmp",".old"};
-  bool removed=false;
-  for(const char *directory:directories) for(const char *filename:filenames)
-    for(const char *suffix:suffixes){
-      const std::string path=std::string(directory)+"/"+filename+suffix;
-      if(remove(path.c_str())==0) removed=true;
-    }
-  if(removed) fsdevCommitDevice("sdmc");
-}
-
 struct GLay { int cols, rows, cw, chh, gapx, gapy, x0, y0, titleH; };
 static GLay gridLayout(){
   GLay g;
-  const bool big=highResolutionUi();
-  g.gapx=big?24:18;
-  g.gapy=big?18:14;
-  if(g_launcherPortrait){ g.gapx=big?20:14; g.gapy=big?20:16; }
-  g.titleH=g_showGameTitles?(big?30:24):0;
-  int topBar=topBarH();
-  int footer=g_launcherPortrait?(big?124:96):(big?54:38);
+  g.gapx=18;
+  g.gapy=14;
+  if(g_launcherPortrait){ g.gapx=14; g.gapy=16; }
+  g.titleH=g_showGameTitles?fontHeight(g_font_sm):0;
+  // A little breathing room under the page header so the first row of covers
+  // never touches the header's hairline.
+  int topBar=topBarH()+18;
+  // Measure the real footer instead of guessing: a hint row that wraps used to
+  // overlap the bottom row of covers.
+  const auto hints=libraryFooter();
+  int footer=measureFooter(hints.data(),(int)hints.size()).height+12;
   g.cols=g_gridColumns;
   g.rows=g_gridRows;
   if(g_launcherPortrait){
@@ -7013,7 +7725,7 @@ static GLay gridLayout(){
     const int capacity=g_gridColumns*g_gridRows;
     long long bestArea=-1;
     int bestColumns=1,bestRows=capacity;
-    const int margin=big?60:32;
+    const int margin=32;
     const int caption=g.titleH?g.titleH+8:0;
     const int availableHeight=SH-topBar-footer;
     for(int columns=1;columns<=capacity;columns++){
@@ -7034,7 +7746,7 @@ static GLay gridLayout(){
   int caption=g.titleH?g.titleH+8:0;
   int maxCoverH=(availH-(g.rows-1)*g.gapy-g.rows*caption)/g.rows;
   if(maxCoverH<72) maxCoverH=72;
-  int margin = big?60:(g_launcherPortrait?32:40);
+  int margin = g_launcherPortrait?32:40;
   int autoWidth=maxCoverH*2/3;
   int maxCoverW=(SW-2*margin-(g.cols-1)*g.gapx)/g.cols;
   g.cw=std::max(48,std::min(autoWidth,maxCoverW));
@@ -7047,7 +7759,10 @@ static GLay gridLayout(){
   return g;
 }
 static int gridHitTest(int px,int py,int top){
-  GLay L=gridLayout(); int n=(int)g_games.size();
+  // Bound by the *rendered* list, not the whole library: under an active
+  // filter g_games is larger than g_libraryView, and returning an index past
+  // the view's end makes the caller subscript it out of range.
+  GLay L=gridLayout(); int n=(int)g_libraryView.size();
   int rowStride=L.chh+(L.titleH?L.titleH+8:0)+L.gapy;
   for(int r=0;r<L.rows;r++) for(int c=0;c<L.cols;c++){
     int idx=(top+r)*L.cols+c; if(idx>=n) continue;
@@ -7066,13 +7781,7 @@ static void drawTitleCell(int cx,int cellW,int y,const std::string&title,bool se
     drawTextC(f,cx,y,shortened.c_str(),col);
     return;
   }
-  SDL_Rect clip={x0,y-2,cellW,(f?TTF_FontHeight(f):26)+8};
-  SDL_RenderSetClipRect(g_ren,&clip);
-  int span=tw-cellW;
-  float t=(SDL_GetTicks()%5000)/5000.0f;
-  float pp = t<0.5f ? t*2.f : (1.f-t)*2.f;
-  drawText(f,x0-(int)(pp*span),y,title.c_str(),col);
-  SDL_RenderSetClipRect(g_ren,nullptr);
+  drawScrollTextL(f,x0,y,cellW,title.c_str(),col);
 }
 
 static void drawScrollTextR(TTF_Font*f,int xRight,int y,int maxW,const char*s,SDL_Color c){
@@ -7080,12 +7789,9 @@ static void drawScrollTextR(TTF_Font*f,int xRight,int y,int maxW,const char*s,SD
   int tw=textW(f,s);
   if(tw<=maxW){ drawTextR(f,xRight,y,s,c); return; }
   int x0=xRight-maxW;
-  SDL_Rect clip={x0,y-2,maxW,(f?TTF_FontHeight(f):26)+6};
+  SDL_Rect clip={x0,y-2,maxW,(f?fontHeight(f):26)+6};
   SDL_RenderSetClipRect(g_ren,&clip);
-  int span=tw-maxW;
-  float t=(SDL_GetTicks()%6000)/6000.0f;
-  float pp=t<0.5f? t*2.f : (1.f-t)*2.f;
-  drawText(f,x0-(int)(pp*span),y,s,c);
+  drawText(f,x0-textScrollOffset(x0,y,tw-maxW,s),y,s,c);
   SDL_RenderSetClipRect(g_ren,nullptr);
 }
 
@@ -7093,12 +7799,9 @@ static void drawScrollTextL(TTF_Font*f,int x,int y,int maxW,const char*s,SDL_Col
   if(maxW<=0 || !s || !*s) return;
   int tw=textW(f,s);
   if(tw<=maxW){ drawText(f,x,y,s,c); return; }
-  SDL_Rect clip={x,y-2,maxW,(f?TTF_FontHeight(f):26)+6};
+  SDL_Rect clip={x,y-2,maxW,(f?fontHeight(f):26)+6};
   SDL_RenderSetClipRect(g_ren,&clip);
-  int span=tw-maxW;
-  float t=(SDL_GetTicks()%6000)/6000.0f;
-  float pp=t<0.5f? t*2.f : (1.f-t)*2.f;
-  drawText(f,x-(int)(pp*span),y,s,c);
+  drawText(f,x-textScrollOffset(x,y,tw-maxW,s),y,s,c);
   SDL_RenderSetClipRect(g_ren,nullptr);
 }
 
@@ -7106,30 +7809,23 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
   clearUiBackground();
   g_cover_budget = COVER_REQUEST_BUDGET;
   if(sel>=0 && sel<(int)g_libraryView.size()) ensureCover(*g_libraryView[sel],true);
+  const Game *selectedGame=(sel>=0&&sel<(int)g_libraryView.size())?g_libraryView[sel]:nullptr;
   GLay L=gridLayout();
   int n=(int)g_libraryView.size(), per=L.cols*L.rows;
   int pages=n?(n+per-1)/per:1, pageIndex=n?sel/per:0, page=pageIndex+1;
-  int bandH = g_launcherPortrait?topBarH()-4:L.y0-4;
-  fillRect(0,0,SW,bandH,COL_PANEL);
-  if(!hasAnimatedBackground()) fillRect(0,bandH,SW,2,COL_SEL);
-  char pinfo[160]; snprintf(pinfo,sizeof(pinfo),"%d / %d    \xc2\xb7    Page %d / %d    \xc2\xb7    Sort: %s",n?sel+1:0,n,page,pages,SORT_NAME[g_sort]);
-  if(g_launcherPortrait){
-    int logoH=highResolutionUi()?62:48,logoW=logoH*16/9;
-    if(g_logo){ SDL_Rect logoRect={18,10,logoW,logoH}; SDL_RenderCopy(g_ren,g_logo,nullptr,&logoRect); }
-    const int infoWidth=std::max(80,SW-2*(logoW+34));
-    const std::string shownInfo=fittedText(g_font_sm,pinfo,infoWidth);
-    drawTextC(g_font_sm,SW/2,highResolutionUi()?22:15,shownInfo.c_str(),COL_VAL);
-    const std::string shownFolder=fittedText(g_font_sm,gamedirLabel,SW-52);
-    drawTextC(g_font_sm,SW/2,bandH-TTF_FontHeight(g_font_sm)-12,
-              shownFolder.c_str(),COL_DIM);
-  } else {
-    int lh = bandH - 12;
-    if(g_logo){ SDL_Rect ld={26,(bandH-lh)/2,lh*16/9,lh}; SDL_RenderCopy(g_ren,g_logo,nullptr,&ld); }
-    drawTextC(g_font,SW/2,(bandH-TTF_FontHeight(g_font))/2,pinfo,COL_VAL);
-    int pinfoRight=SW/2+textW(g_font,pinfo)/2;
-    int folderMaxW=(SW-34)-(pinfoRight+24);
-    drawScrollTextR(g_font_sm,SW-34,(bandH-TTF_FontHeight(g_font_sm))/2,folderMaxW,gamedirLabel,COL_DIM);
-  }
+  // The shared page header replaces the hand-built title band: the selected
+  // game becomes the page title, the folder/game code the eyebrow, and the
+  // counters and sort order the right-hand metadata.
+  const std::string topLabel=selectedGame&&!selectedGame->gameCode.empty()?
+      selectedGame->gameCode:std::string(gamedirLabel?gamedirLabel:"");
+  const std::string library(LauncherLocalization::Translate("Library"));
+  const std::string eyebrow=library+(topLabel.empty()?"":" \xc2\xb7 "+topLabel);
+  const std::string summary=std::to_string(n?sel+1:0)+" / "+std::to_string(n)+" \xc2\xb7 "+
+      std::string(LauncherLocalization::Translate("Page"))+" "+std::to_string(page)+
+      " / "+std::to_string(pages);
+  const std::string sorting(LauncherLocalization::Translate(SORT_NAME[g_sort]));
+  drawPageHeader(selectedGame?selectedGame->title.c_str():library.c_str(),
+                 eyebrow.c_str(),summary.c_str(),sorting.c_str());
 
   int rowStride=L.chh+(L.titleH?L.titleH+8:0)+L.gapy;
   for(int r=0;r<L.rows;r++) for(int c=0;c<L.cols;c++){
@@ -7143,15 +7839,15 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
     fillRect(x+2,y+3,L.cw,L.chh,(SDL_Color){0,0,0,70});
     if(g.cover){
       Uint32 el=SDL_GetTicks()-g.coverAt; Uint8 fa=!g_uiAnimations?255:(el<180?(Uint8)(255*el/180):255);
-      drawGameArtwork(g,x,y,L.cw,L.chh,fa,cur?255:150);
+      drawGameArtwork(g,x,y,L.cw,L.chh,fa,cur?255:225);
     }
-    else { fillRect(x,y,L.cw,L.chh,COL_CARD); drawTextC(g_font_sm,x+L.cw/2,y+L.chh/2-8,"NO COVER",COL_DIM); }
+    else { fillRect(x,y,L.cw,L.chh,COL_CARD);
+      const std::string noCover=fittedText(g_font_sm,
+          std::string(LauncherLocalization::Translate("NO COVER")),L.cw-12);
+      drawTextC(g_font_sm,x+L.cw/2,y+L.chh/2-8,noCover.c_str(),COL_DIM); }
     border(x,y,L.cw,L.chh,1,(SDL_Color){12,13,18,255});
     fillRect(x,y,L.cw,1,(SDL_Color){255,255,255,26});
-    if(cur){ const int G=6;
-      for(int i=G;i>=1;i--){ Uint8 a=(Uint8)(150*(G-i+1)/G); border(x-2-i,y-2-i,L.cw+4+2*i,L.chh+4+2*i,1,(SDL_Color){255,170,0,a}); }
-      border(x-2,y-2,L.cw+4,L.chh+4,2,COL_SEL);
-    }
+    if(cur) border(x-2,y-2,L.cw+4,L.chh+4,2,COL_SEL);
     if(g_showRegionFlags && g.region>0 && g_flag[g.region]){
       int fw=L.cw*26/100; if(fw>30)fw=30; if(fw<16)fw=16; int fh=fw*2/3;
       SDL_Rect fd={x+6,y+6,fw,fh}; SDL_RenderCopy(g_ren,g_flag[g.region],nullptr,&fd);
@@ -7168,14 +7864,12 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
   const int prefetchStart=(pageIndex+1)*per;
   for(int index=prefetchStart;index<std::min(n,prefetchStart+per);index++)
     ensureCover(*g_libraryView[index]);
-  if(n==0) drawTextC(g_font,SW/2,SH/2,"No games found -- open Settings > Library & storage",COL_DIM);
+  // The empty-library message sits on a panel like every other status screen.
+  if(n==0) drawStatusPanel("No games found -- open Settings > Library & storage");
   drawUpdateNotification();
-  FootItem foot[] = {
-    { "A", "Launch", FA_LAUNCH }, { "Y", "Sort", FA_SORT },
-    { "X", "Settings", FA_SETTINGS }, { "+", "Game Menu", FA_OPTIONS },
-    { "-", "Filter", FA_FILTER }, { "L", "", FA_PAGEL }, { "R", "Page", FA_PAGER }, { "B", "Quit", FA_QUIT },
-  };
-  drawFooterHints(foot, 8, SH-26);
+  FootItem foot[8]={};
+  const int hintCount=libraryFooterFor(foot,n,pages);
+  drawFooterHints(foot,hintCount,SH-26);
   presentUi();
 }
 
@@ -7234,12 +7928,15 @@ static void cleanupLauncher() {
   g_logo=nullptr;
   if(g_glowTexture) SDL_DestroyTexture(g_glowTexture);
   g_glowTexture=nullptr;
+  if(g_roundTexture) SDL_DestroyTexture(g_roundTexture);
+  g_roundTexture=nullptr;
   if(g_uiTarget) SDL_DestroyTexture(g_uiTarget);
   g_uiTarget=nullptr;
   if(g_font) TTF_CloseFont(g_font);
   if(g_font_sm) TTF_CloseFont(g_font_sm);
   if(g_font_big) TTF_CloseFont(g_font_big);
-  g_font=g_font_sm=g_font_big=nullptr;
+  if(g_font_caption) TTF_CloseFont(g_font_caption);
+  g_font=g_font_sm=g_font_big=g_font_caption=nullptr;
   g_uiFontType=PlSharedFontType_Total;
   if(g_plReady) plExit();
   g_plReady=false;
@@ -7310,19 +8007,22 @@ static void runAppletInstaller(){
       const bool pressed=event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CONFIRM;
       const bool touched=touch==TOUCH_TAP&&tx>=buttonX&&tx<buttonX+buttonWidth&&ty>=buttonY&&ty<buttonY+buttonHeight;
       if(pressed||touched){
-        clearUiBackground();drawHeader(LauncherLocalization::Translate("Applet mode installer").data(),nullptr);drawTextC(g_font,SW/2,SH/2,LauncherLocalization::Translate("Installing...").data(),COL_VAL);presentUi();
+        clearUiBackground();drawHeader(LauncherLocalization::Translate("Applet mode installer").data(),nullptr);
+        drawStatusPanel(LauncherLocalization::Translate("Installing...").data());presentUi();
         appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);char error[256]{};const bool installed=forwarder_create_launcher(error,sizeof(error));appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
         if(installed)modalMessage("Drastic DS",{tr("HOME Menu shortcut installed.")});else modalMessage(tr("Shortcut failed").c_str(),{error[0]?error:tr("Unknown error")});beginScreenFx();
       }
       if(event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL)return;
     }
-    clearUiBackground();glassPanel(panelX,panelY,panelWidth,panelHeight);border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-    drawTextC(g_font_big,SW/2,panelY+44,LauncherLocalization::Translate("Applet mode installer").data(),COL_SEL);
+    clearUiBackground();glassPanel(panelX,panelY,panelWidth,panelHeight);
+    drawText(g_font_big,panelX+28,panelY+22,
+             fittedText(g_font_big,std::string(LauncherLocalization::Translate("Applet mode installer")),panelWidth-56).c_str(),COL_TXT);
+    fillRect(panelX+28,panelY+72,panelWidth-56,1,(SDL_Color){255,255,255,24});
     const auto lines=wrapDialogLines({tr("Drastic DS is running in applet mode."),tr("Install a HOME Menu shortcut to run it with full memory and normal performance.")},panelWidth-96);
-    int lineY=panelY+132;for(const std::string &line:lines){if(lineY+TTF_FontHeight(g_font)>=buttonY-28)break;drawTextC(g_font,SW/2,lineY,line.c_str(),COL_TXT);lineY+=TTF_FontHeight(g_font)+12;}
-    fillRect(buttonX,buttonY,buttonWidth,buttonHeight,COL_FOCUS);border(buttonX,buttonY,buttonWidth,buttonHeight,3,COL_SEL);
-    drawTextC(g_font,SW/2,buttonY+(buttonHeight-TTF_FontHeight(g_font))/2,LauncherLocalization::Translate("Install").data(),COL_VAL);
-    const std::string install=tr("Install"),back=tr("Back");FootItem footer[]={{"A",install.c_str(),FA_NONE},{"B",back.c_str(),FA_NONE}};drawFooterHints(footer,2,panelY+panelHeight-18);
+    int lineY=panelY+132;for(const std::string &line:lines){if(lineY+fontHeight(g_font)>=buttonY-28)break;drawTextC(g_font,SW/2,lineY,line.c_str(),COL_TXT);lineY+=fontHeight(g_font)+12;}
+    drawButtonPanel(buttonX,buttonY,buttonWidth,buttonHeight,true);
+    drawTextC(g_font,SW/2,buttonY+(buttonHeight-fontHeight(g_font))/2,LauncherLocalization::Translate("Install").data(),COL_VAL);
+    FootItem footer[]={{"A","Install",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,panelY+panelHeight-18);
     drawFadeIn();presentUi();waitForNextUiFrame();
   }
 }
@@ -7356,9 +8056,18 @@ int main(int argc, char **argv){
   g_ren=SDL_CreateRenderer(g_win,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
   if(!g_ren) return startupFailure("Could not create the launcher renderer.");
   SDL_SetRenderDrawBlendMode(g_ren,SDL_BLENDMODE_BLEND);
+  {
+    SDL_RendererInfo rendererInfo{};
+    g_presentVsync=SDL_GetRendererInfo(g_ren,&rendererInfo)==0&&
+                   (rendererInfo.flags&SDL_RENDERER_PRESENTVSYNC)!=0;
+  }
   if(SDL_GetRendererOutputSize(g_ren,&SW,&SH)!=0) return startupFailure("Could not query the display size.");
   g_outputW=SW;
   g_outputH=SH;
+  // Establish the 720p logical space and its scale before any font is opened:
+  // reloadUiFonts() sizes its faces from g_uiScale.
+  if(!configureLauncherOrientation(0))
+    return startupFailure("Could not configure the launcher display.");
   if(SDL_Surface *logo=IMG_Load("romfs:/logo.png")){ g_logo=SDL_CreateTextureFromSurface(g_ren,logo); SDL_FreeSurface(logo); }
   makeFlags();
   for(int index=0;index<SDL_NumJoysticks();index++) if(SDL_IsGameController(index)){ openController(index); break; }
@@ -7375,17 +8084,19 @@ int main(int argc, char **argv){
     runAppletInstaller();cleanupLauncher();return 0;
   }
 
+  // First boot creates the data directories, retires legacy hosts and brings up
+  // networking before the library scan. None of it drew a frame, so the console
+  // sat on black for seconds. Each step now reports itself under the logo.
+  bootStatus("Network");
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
+  bootStatus("Library & storage");
   const char *directories[]={"sdmc:/switch",DATA_DIR,EMU_HOST_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,DEF_GAMEDIR,SYSTEM_DIR,USER_DIR,CACHE_DIR,LSFG_DIR,
                              "sdmc:/switch/drastic/cheats","sdmc:/switch/drastic/scripts",SHADERS_DIR,
                              "sdmc:/switch/drastic/slot2","sdmc:/switch/drastic/microphone",
                              "sdmc:/switch/drastic/user/savestates","sdmc:/switch/drastic/user/backup"};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the Drastic DS data directories.");
-  /* Earlier builds used separate Vulkan and OpenGL executables. The unified
-     host supersedes them, so remove every known stale copy on the first
-     launcher boot after updating. */
-  cleanupLegacyEmuHosts();
+  bootStatus("Loading game library...");
 
   if(!updateRecoveryOk)
     modalMessage("Update recovery failed",{updateRecoveryError,"The installed launcher was left unchanged."});
@@ -7513,6 +8224,10 @@ int main(int argc, char **argv){
   if(!silentDirectForwarder) startGameScan(std::move(initialGamePaths),true);
 
   int sel=0,top=0,rows=1;
+  // Only follow the selected game across an incoming scan batch once the user
+  // has actually picked something; otherwise a streaming batch would drag the
+  // cursor around before the first input.
+  bool keepLibrarySelection=false;
   bool running=true,launch=false,userExit=false;
   std::string launchKey,launchPathKey,launchLegacyKey,launchPath;
   bool launchLegacyUnique=false;
@@ -7598,7 +8313,18 @@ int main(int argc, char **argv){
   std::vector<std::string> pendingMountedSources;
 
   while(running&&beginUiFrame()){
-    pumpGameScan();
+    if(g_libraryScan){
+      std::string selectedKey;
+      if(keepLibrarySelection&&sel>=0&&sel<(int)g_libraryView.size())
+        selectedKey=g_libraryView[sel]->key;
+      pumpGameScan();
+      if(selectedKey.empty()) sel=keepLibrarySelection?sel:0;
+      else{
+        sel=0;
+        for(size_t index=0;index<g_libraryView.size();index++)
+          if(g_libraryView[index]->key==selectedKey){ sel=(int)index; break; }
+      }
+    } else pumpGameScan();
     if(!silentDirectForwarder&&!g_libraryScan&&!pendingMountedSources.empty()){
       startGameScan(std::move(pendingMountedSources),false);pendingMountedSources.clear();
     }
@@ -7671,16 +8397,22 @@ int main(int argc, char **argv){
       continue;
     }
     GLay layout=gridLayout(); int cols=layout.cols; rows=layout.rows;
+    // Derived, never tracked: the first visible row always follows the cursor.
+    top=g_libraryView.empty()?0:(sel/(cols*rows))*rows;
     SDL_Event event; navRepeat();
     while(pollUiEvent(event)){
       pumpStick(event);
-      int tx=0,ty=0,n=(int)g_libraryView.size(); TouchKind touch=touchFeed(event,&tx,&ty);
-      if(touch==TOUCH_SWIPE_L||touch==TOUCH_SWIPE_R){ sel=gridPage(sel,touch==TOUCH_SWIPE_L?1:-1,cols,rows,n); top=n?(sel/(cols*rows))*rows:0; continue; }
+      int tx=0,ty=0,n=(int)g_libraryView.size();
+      // A sub-screen opened earlier in this same event batch (per-game menu,
+      // filter picker) may have rebuilt the view under us.
+      if(sel>=n) sel=std::max(0,n-1);
+      TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touch==TOUCH_SWIPE_L||touch==TOUCH_SWIPE_R){ sel=gridPage(sel,touch==TOUCH_SWIPE_L?1:-1,cols,rows,n); top=n?(sel/(cols*rows))*rows:0; keepLibrarySelection=true; continue; }
       if(touch==TOUCH_TAP){
         int action=footTapAct(tx,ty);
         if(action==FA_NONE){
           int hit=gridHitTest(tx,ty,top);
-          if(hit>=0){ if(hit==sel&&n) selectGame(*g_libraryView[sel]); else sel=hit; }
+          if(hit>=0){ keepLibrarySelection=true; if(hit==sel&&n) selectGame(*g_libraryView[sel]); else sel=hit; }
         } else {
           SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN;
           switch(action){
@@ -7688,9 +8420,9 @@ int main(int argc, char **argv){
             case FA_SORT: press.cbutton.button=SDL_CONTROLLER_BUTTON_X; SDL_PushEvent(&press); break;
             case FA_OPTIONS: press.cbutton.button=SDL_CONTROLLER_BUTTON_START; SDL_PushEvent(&press); break;
             case FA_SETTINGS: press.cbutton.button=BTN_SETTINGS; SDL_PushEvent(&press); break;
-            case FA_FILTER: chooseLibraryFilter();sel=top=0;break;
-            case FA_PAGEL: sel=gridPage(sel,-1,cols,rows,n); break;
-            case FA_PAGER: sel=gridPage(sel,1,cols,rows,n); break;
+            case FA_FILTER: chooseLibraryFilter();sel=top=0;keepLibrarySelection=false;break;
+            case FA_PAGEL: sel=gridPage(sel,-1,cols,rows,n); keepLibrarySelection=true; break;
+            case FA_PAGER: sel=gridPage(sel,1,cols,rows,n); keepLibrarySelection=true; break;
             case FA_QUIT: requestExit(); break;
           }
         }
@@ -7700,14 +8432,15 @@ int main(int argc, char **argv){
       }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
       switch(event.cbutton.button){
-        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: sel=gridNav(sel,-1,0,cols,rows,n); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: sel=gridNav(sel,1,0,cols,rows,n); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP: sel=gridNav(sel,0,-1,cols,rows,n); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=gridNav(sel,0,1,cols,rows,n); break;
-        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: sel=gridPage(sel,-1,cols,rows,n); break;
-        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: sel=gridPage(sel,1,cols,rows,n); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: sel=gridNav(sel,-1,0,cols,rows,n); keepLibrarySelection=true; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: sel=gridNav(sel,1,0,cols,rows,n); keepLibrarySelection=true; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP: sel=gridNav(sel,0,-1,cols,rows,n); keepLibrarySelection=true; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=gridNav(sel,0,1,cols,rows,n); keepLibrarySelection=true; break;
+        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: sel=gridPage(sel,-1,cols,rows,n); keepLibrarySelection=true; break;
+        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: sel=gridPage(sel,1,cols,rows,n); keepLibrarySelection=true; break;
         case SDL_CONTROLLER_BUTTON_X:
           if(n){
+            keepLibrarySelection=true;
             std::string keep=g_libraryView[sel]->key; g_sort=(g_sort+1)%SORT_COUNT;
             storeSet(g_global,"Wrapper/SortMode",std::to_string(g_sort).c_str()); storeSave(g_global,LAUNCHER_INI);
             applySort(); sel=0; for(int index=0;index<(int)g_libraryView.size();index++) if(g_libraryView[index]->key==keep){ sel=index; break; }
@@ -7715,9 +8448,9 @@ int main(int argc, char **argv){
           break;
         case BTN_CONFIRM: if(n) selectGame(*g_libraryView[sel]); break;
         case SDL_CONTROLLER_BUTTON_START:
-          if(n){ Game *game=g_libraryView[sel];int result=perGameMenu(*game,g_pad); if(result==1) selectGame(*game); else if(result==2){ startGameScan(gamePaths,true); sel=top=0; } }
+          if(n){ Game *game=g_libraryView[sel];int result=perGameMenu(*game,g_pad); if(result==1) selectGame(*game); else if(result==2){ startGameScan(gamePaths,true); sel=top=0; keepLibrarySelection=false; } }
           break;
-        case SDL_CONTROLLER_BUTTON_BACK: chooseLibraryFilter();sel=top=0;break;
+        case SDL_CONTROLLER_BUTTON_BACK: chooseLibraryFilter();sel=top=0;keepLibrarySelection=false;break;
         case BTN_SETTINGS: {
           std::vector<std::string> oldPaths=gamePaths;
           g_active=&g_global; runSettingsRoot(g_pad,nullptr); storeSave(g_global,LAUNCHER_INI);
@@ -7731,6 +8464,7 @@ int main(int argc, char **argv){
             refreshConfiguredUsbSources(gamePaths);
             startGameScan(gamePaths,true);
             sel=top=0;
+            keepLibrarySelection=false;
             g_rescanAfterSettings=false;
           }
           break;
@@ -7739,12 +8473,26 @@ int main(int argc, char **argv){
       }
       top=n?(sel/(cols*rows))*rows:0;
     }
-    const std::string location=!g_libraryView.empty()?gameLocationLabel(*g_libraryView[sel]):"No game selected";
+    // perGameMenu can shrink the view (organizeGame rebuilds it) after the
+    // frame-start clamp above has already run, so re-check the bound here.
+    const std::string location=(sel>=0&&sel<(int)g_libraryView.size())?
+        gameLocationLabel(*g_libraryView[sel]):"No game selected";
     renderGrid(sel,top,location.c_str());
     waitForNextUiFrame(true,usbRefreshAt);
   }
 
-  if(userExit&&g_ren){clearUiBackground();drawTextC(g_font_big,SW/2,SH/2-42,LauncherLocalization::Translate("Closing Drastic DS...").data(),COL_VAL);drawTextC(g_font_sm,SW/2,SH/2+28,LauncherLocalization::Translate("Finishing background operations safely.").data(),COL_DIM);presentUi();}
+  if(userExit&&g_ren){
+    clearUiBackground();
+    // The shutdown notice gets the same glass container as every other status
+    // screen instead of floating on the bare background.
+    const int panelWidth=std::min(940,SW-64),panelHeight=200;
+    glassPanel((SW-panelWidth)/2,(SH-panelHeight)/2,panelWidth,panelHeight);
+    drawTextC(g_font_big,SW/2,SH/2-42,
+              LauncherLocalization::Translate("Closing Drastic DS...").data(),COL_VAL);
+    drawTextC(g_font_sm,SW/2,SH/2+28,
+              LauncherLocalization::Translate("Finishing background operations safely.").data(),COL_DIM);
+    presentUi();
+  }
   storageInitCancel=true;stopGameScan();
   if(storageInitWorker.joinable())storageInitWorker.join();
   SwitchStorage::SetUsbStatusCallback(nullptr,nullptr);
@@ -7785,9 +8533,26 @@ int main(int argc, char **argv){
     std::string emulatorSource="romfs:/emu/DrasticDS_nx.nro";
     std::string emulatorDestination=std::string(EMU_HOST_DIR)+"/DrasticDS_nx.nro";
     emulatorNro=emulatorDestination;
+    // One bar across all three stages: measure every source up front and let the
+    // copy loop tick it. A stage that is already current snaps to its boundary.
+    const long long coreBytes=setupFileBytes(coreSource.c_str());
+    const long long emulatorBytes=setupFileBytes(emulatorSource.c_str());
+    const long long resourceBytes=setupFileBytes("romfs:/res/game_database.xml")+
+                                  setupFileBytes("romfs:/res/usrcheat.dat");
+    g_setupTotal=coreBytes+emulatorBytes+resourceBytes;
+    g_setupDone=0; g_setupPct=-1; g_setupAborted=false;
+
+    g_setupDetail=LauncherLocalization::Translate("Emulator core").data();
     bool haveCore=ensureCore(coreSource.c_str(),coreDestination.c_str(),"109");
+    g_setupDone=std::max(g_setupDone,coreBytes);
+    g_setupDetail=LauncherLocalization::Translate("Emulator").data();
     bool haveEmulator=ensureEmu(emulatorSource.c_str(),emulatorDestination.c_str());
+    g_setupDone=std::max(g_setupDone,coreBytes+emulatorBytes);
+    g_setupDetail=LauncherLocalization::Translate("Game resources").data();
     bool haveResources=ensureResources();
+    g_setupDone=std::max(g_setupDone,g_setupTotal);
+    if(g_setupPct>=0) setupTick(0);
+    g_setupTotal=0;
     bool haveSystemFiles=userSystemFilesPresent();
     appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
     storeSet(effective,"Wrapper/CoreSo",CORE_SO_PATH);
