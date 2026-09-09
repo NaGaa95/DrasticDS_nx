@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #ifndef DRASTIC_NX_VERSION
-#define DRASTIC_NX_VERSION "1.1.0"
+#define DRASTIC_NX_VERSION "1.1.1"
 #endif
 
 namespace
