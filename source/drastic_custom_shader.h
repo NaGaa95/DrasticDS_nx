@@ -20,6 +20,7 @@ enum DrasticCustomShaderLoadFlags {
   DRASTIC_CUSTOM_SHADER_LOAD_SOURCES = 1u << 0,
   DRASTIC_CUSTOM_SHADER_LOAD_PIXELS = 1u << 1,
   DRASTIC_CUSTOM_SHADER_LOAD_SPIRV = 1u << 2,
+  DRASTIC_CUSTOM_SHADER_LOAD_DEKO3D = 1u << 3,
 };
 
 typedef enum {
@@ -66,6 +67,10 @@ typedef struct {
   size_t vertex_spirv_size;
   uint8_t *fragment_spirv;
   size_t fragment_spirv_size;
+  uint8_t *vertex_deko3d;
+  size_t vertex_deko3d_size;
+  uint8_t *fragment_deko3d;
+  size_t fragment_deko3d_size;
 } DrasticCustomPass;
 
 typedef struct {
@@ -81,6 +86,7 @@ typedef struct {
   char name[DRASTIC_CUSTOM_SHADER_NAME_MAX];
   char relative_path[DRASTIC_CUSTOM_SHADER_PATH_MAX];
   int vulkan_ready;
+  int deko3d_ready;
 } DrasticCustomShaderEntry;
 
 bool drastic_custom_shader_load(const char *relative_path, unsigned flags,
@@ -92,6 +98,8 @@ size_t drastic_custom_shader_scan(DrasticCustomShaderEntry *entries,
                                   size_t capacity);
 bool drastic_custom_shader_vulkan_ready(const char *relative_path,
                                         char *error, size_t error_size);
+bool drastic_custom_shader_deko3d_ready(const char *relative_path,
+                                       char *error, size_t error_size);
 
 #ifdef __cplusplus
 }

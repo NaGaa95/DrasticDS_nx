@@ -755,11 +755,9 @@ static void set_import_address(const char *name, uintptr_t address) {
   }
 }
 
-static void select_vulkan_graphics_imports(void) {
-  /* The Vulkan presenter receives the completed DS screens through the two
-   * texture upload hooks.  Every other Android GLES/EGL entry point remains a
-   * benign stub, matching the former dedicated Vulkan host without exporting
-   * duplicate Mesa symbols from a second executable. */
+static void select_native_graphics_imports(void) {
+  /* Native display backends never create an Android GLES/EGL context. Vulkan
+   * keeps its existing upload capture; Deko3D reads the producer banks itself. */
   for (size_t index = 0; index < dynlib_numfunctions; index++) {
     const char *name = dynlib_functions[index].symbol;
     if ((name[0] == 'g' && name[1] == 'l' &&
@@ -768,10 +766,12 @@ static void select_vulkan_graphics_imports(void) {
       dynlib_functions[index].func = (uintptr_t)&ret0;
   }
 
-  set_import_address("glBindTexture",
-                     (uintptr_t)&drastic_vk_capture_gl_bind_texture);
-  set_import_address("glTexSubImage2D",
-                     (uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d);
+  if (drastic_renderer_is_vulkan()) {
+    set_import_address("glBindTexture",
+                       (uintptr_t)&drastic_vk_capture_gl_bind_texture);
+    set_import_address("glTexSubImage2D",
+                       (uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d);
+  }
   set_import_address("eglInitialize", (uintptr_t)&vk_egl_initialize);
   set_import_address("eglChooseConfig", (uintptr_t)&vk_egl_choose_config);
   set_import_address("eglGetConfigAttrib",
@@ -797,5 +797,6 @@ void update_imports(void) {
     g_ctype_table[c + 1] = m;
   }
   g_ctype_table[0] = 0;
-  if (drastic_renderer_is_vulkan()) select_vulkan_graphics_imports();
+  if (drastic_renderer_is_vulkan() || drastic_renderer_is_deko3d())
+    select_native_graphics_imports();
 }

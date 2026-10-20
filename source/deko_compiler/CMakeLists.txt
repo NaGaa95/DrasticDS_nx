@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.22)
+project(DrasticDekoDependencies LANGUAGES C CXX)
+get_filename_component(DRASTIC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+option(DEKO3D_SHADER_TESTS "Build native shader compiler on the host" OFF)
+include(Uam.cmake)
+include(FetchContent)
+FetchContent_Declare(spirv_cross
+  GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+  GIT_TAG ebe2aa0cd80f5eb5cd8a605da604cacf72205f3b)
+FetchContent_GetProperties(spirv_cross)
+if(NOT spirv_cross_POPULATED)
+  FetchContent_Populate(spirv_cross)
+endif()
+set(LSFG_SPIRV_CROSS_ROOT "${spirv_cross_SOURCE_DIR}")
+set(LSFG_UAM_BRIDGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+add_subdirectory("${DRASTIC_ROOT}/third_party/lsfg-deko3d" lsfg)
+if(DEKO3D_SHADER_TESTS AND NOT CMAKE_CROSSCOMPILING)
+  add_executable(deko_lsfg_validation "${DRASTIC_ROOT}/tools/tests/deko_lsfg_validation.cpp")
+  target_compile_features(deko_lsfg_validation PRIVATE cxx_std_20)
+  target_link_libraries(deko_lsfg_validation PRIVATE lsfg)
+  if(DEKO3D_TEST_LIBNX_INCLUDE)
+    add_executable(deko_present_validation "${DRASTIC_ROOT}/tools/tests/deko_present_recording.cpp")
+    target_compile_features(deko_present_validation PRIVATE cxx_std_20)
+    target_include_directories(deko_present_validation PRIVATE
+      "${DRASTIC_ROOT}/tools/tests/deko_mocks" "${DEKO3D_TEST_LIBNX_INCLUDE}")
+    target_sources(deko_lsfg_validation PRIVATE
+      "${DRASTIC_ROOT}/source/lsfg/drastic_deko_lsfg.cpp"
+      "${DRASTIC_ROOT}/tools/tests/deko_lsfg_recording.cpp")
+    target_include_directories(deko_lsfg_validation PRIVATE "${DEKO3D_TEST_LIBNX_INCLUDE}")
+    target_compile_definitions(deko_lsfg_validation PRIVATE DEKO3D_RECORDING_TEST)
+  endif()
+endif()

@@ -119,6 +119,11 @@ fi
   echo "glslangValidator is required to compile the Vulkan filters." >&2
   exit 1
 }
+UAM=${UAM:-$(command -v uam || true)}
+[[ -n "$UAM" && -x "$UAM" ]] || {
+  echo "uam (devkitPro tools) is required to compile the native Deko3D shaders." >&2
+  exit 1
+}
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/drasticds-nx.XXXXXX")"
 cleanup() {
@@ -142,6 +147,8 @@ make -C "$APP/launcher/fwd" clean >/dev/null
 echo "==== Drastic Android post-FX programs ===="
 "$PYTHON3" "$APP/tools/build_dfx.py" \
   --source "$DFX_SOURCE" --output "$DFX_STAGE" --glslang "$GLSLANG"
+"$PYTHON3" "$APP/tools/build_deko3d.py" \
+  --source "$DFX_SOURCE" --output "$DFX_STAGE" --uam "$UAM"
 dfx_args=(DFX_GENERATED="$DFX_STAGE")
 
 DEPS_BUILD="$BUILD_CACHE/storage"
@@ -191,9 +198,15 @@ storage_include_args=(
   LIBUSBHSFS_INCLUDE="$LIBUSBHSFS_INCLUDE_DIR"
 )
 
-echo "==== unified DraStic host: Vulkan + NVC0 + Zink ===="
+DEKO_DEPS="$BUILD_CACHE/deko-deps"
+echo "==== native Deko3D LSFG dependencies ===="
+cmake -S "$APP/source/deko_compiler" -B "$DEKO_DEPS" -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$DEKO_DEPS" --parallel "$JOBS"
+
+echo "==== unified DraStic host: Deko3D + Vulkan + NVC0 + Zink ===="
 make -C "$APP" -j"$JOBS" "${storage_include_args[@]}" \
-  "${dfx_args[@]}" MESA_SDK="$MESA_SDK"
+  "${dfx_args[@]}" MESA_SDK="$MESA_SDK" DEKO_DEPS="$DEKO_DEPS"
 
 echo "==== assemble temporary ROMFS ===="
 mkdir -p "$ROMFS_STAGE/cores" "$ROMFS_STAGE/emu" "$ROMFS_STAGE/res"
@@ -210,11 +223,11 @@ cp -f "$BUNDLED_CHEAT_LICENSE/NOTICE.md" \
 cp -f "$BUNDLED_CHEAT_LICENSE/COPYING" \
   "$ROMFS_STAGE/licenses/nds-i-cheat-databases/COPYING"
 
-echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan) ===="
+echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan + Deko3D) ===="
 mkdir -p "$ROMFS_STAGE/shaders"
 cp -a "$BUNDLED_SHADER_SOURCE/." "$ROMFS_STAGE/shaders/"
 "$PYTHON3" "$APP/tools/compile_custom_shader.py" \
-  "$ROMFS_STAGE/shaders" --glslang "$GLSLANG"
+  "$ROMFS_STAGE/shaders" --glslang "$GLSLANG" --uam "$UAM"
 
 echo "==== forwarder stub ===="
 make -C "$APP/launcher/fwd" clean OUT="$ROMFS_STAGE/fwd" >/dev/null
@@ -236,4 +249,4 @@ echo "Done. Copy this one file to the SD card:"
 ls -la "$APP/DrasticDS.nro"
 echo
 echo "The launcher creates sdmc:/switch/drastic/, extracts one unified host on demand,"
-echo "and selects Vulkan, native OpenGL or Zink at runtime."
+echo "and selects Deko3D, Vulkan, native OpenGL or Zink at runtime."

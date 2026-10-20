@@ -27,6 +27,11 @@ STORAGE_BUILD ?= $(TOPDIR)/launcher/dependencies/build
 LIBSMB2_INCLUDE ?= $(STORAGE_BUILD)/_deps/libsmb2-src/include
 LIBUSBHSFS_INCLUDE ?= $(STORAGE_BUILD)/_deps/libusbhsfs-src/include
 MESA_SDK ?= $(TOPDIR)/../mesa-switch-unified-sdk
+DEKO_DEPS ?= $(TOPDIR)/.drasticds-nx-cache/deko-deps
+DEKO_LIBS := $(DEKO_DEPS)/lsfg/liblsfg.a \
+			 $(DEKO_DEPS)/lsfg/liblsfg_spirv_cross.a \
+			 $(DEKO_DEPS)/uam-generated/uam_isolated.o
+INCLUDES += third_party/lsfg-deko3d/include $(DEKO_DEPS)/lsfg/include
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -77,11 +82,11 @@ STORAGE_LIBS := $(STORAGE_BUILD)/_deps/libsmb2-build/lib/libsmb2.a \
 LIBDIRS	:= $(MESA_SDK) $(PORTLIBS) $(LIBNX)
 LIBS	:= -Wl,-u,vk_icdGetInstanceProcAddr \
 		-Wl,-u,vk_icdNegotiateLoaderICDInterfaceVersion -pthread \
-		-Wl,--start-group $(STORAGE_LIBS) -lminizip \
+		-Wl,--start-group $(STORAGE_LIBS) $(DEKO_LIBS) -lminizip \
 		-l:libGLESv2.a -l:libEGL.a -l:libvulkan.a -l:libglapi.a \
 		-l:libmesa_util_c11.a -l:libblake3.a -l:libmesa_util.a \
 		-l:libmesa_util_simd.a -l:libxmlconfig.a \
-		-lelf -lexpat -lzstd -lz -lnx -lstdc++ -lm \
+		-lelf -lexpat -lzstd -lz -ldeko3d -lnx -lstdc++ -lm \
 		-Wl,--end-group
 
 #---------------------------------------------------------------------------------
@@ -174,7 +179,7 @@ $(OUTPUT).nro	:	$(OUTPUT).elf
 endif
 
 # Relink when the prebuilt storage archives change, not only on source edits.
-$(OUTPUT).elf	:	$(OFILES) $(STORAGE_LIBS)
+$(OUTPUT).elf	:	$(OFILES) $(STORAGE_LIBS) $(DEKO_LIBS)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
 

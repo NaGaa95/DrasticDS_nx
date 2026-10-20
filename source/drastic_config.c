@@ -175,8 +175,7 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->integer_scale = prefs_get_bool("Wrapper/IntegerScale", false);
   config->custom_aspect_lock =
       prefs_get_bool("Wrapper/CustomAspectLock", true);
-  config->vulkan_low_latency =
-      prefs_get_bool("Wrapper/VulkanLowLatency", false);
+  config->low_latency = prefs_get_bool("Wrapper/LowLatency", true);
   config->video_filter = read_filter();
   snprintf(config->custom_shader, sizeof(config->custom_shader), "%s",
            prefs_get_string("Wrapper/CustomShader", ""));

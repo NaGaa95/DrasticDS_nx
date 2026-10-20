@@ -2254,7 +2254,7 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   /* LSFG owns presentation pacing and needs its larger swapchain. Keep the
    * native low-latency path mutually exclusive for the lifetime of this
    * renderer, including when LSFG is toggled from the in-game overlay. */
-  g_low_latency = config && config->vulkan_low_latency &&
+  g_low_latency = config && config->low_latency &&
                   !lsfg_launch_enabled;
   __atomic_store_n(&g_lsfg_enabled_requested, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&g_lsfg_runtime_available, 0, __ATOMIC_RELEASE);

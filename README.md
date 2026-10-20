@@ -11,8 +11,8 @@ patches it, and runs it inside a minimal Android-like
 environment natively.
 
 Everything ships as a **single `DrasticDS.nro`**: it bundles the build-supplied
-Drastic core, game database and cheat table, one runtime-selectable Mesa host
-for Vulkan/NVK, native OpenGL/NVC0 and OpenGL-on-NVK through Zink, 56
+Drastic core, game database and cheat table, one runtime-selectable host
+for native Deko3D, Vulkan/NVK, OpenGL/NVC0 and OpenGL-on-NVK through Zink, 56
 ready-to-use custom shaders, and an SDL cover-art launcher.
 Nintendo DS BIOS and firmware are never packed into the NRO.
 
@@ -34,7 +34,7 @@ and bundled application resources on demand:
 /switch/DrasticDS.nro
 /switch/drastic/
   .emu/                   <- hidden runtime host, extracted when first needed
-    DrasticDS_nx.nro      <- Vulkan/NVK + OpenGL/NVC0 + Zink
+    DrasticDS_nx.nro      <- Deko3D + Vulkan/NVK + OpenGL/NVC0 + Zink
   cache/
   cheats/                 <- custom Action Replay files
   cores/                  <- Drastic ARM64 core, auto-extracted
@@ -46,7 +46,7 @@ and bundled application resources on demand:
   microphone/             <- optional microphone samples
   scripts/                <- Lua scripts
   shaders/                <- custom DraStic .dfx/.dsd post-FX shaders
-    Bundled/              <- auto-installed OpenGL sources + Vulkan packs
+    Bundled/              <- OpenGL sources + Vulkan and Deko3D packs
   slot2/                  <- Slot-2 data
   system/
     nds_bios_arm7.bin     <- your ARM7 BIOS dump (you supply)
@@ -139,27 +139,62 @@ settings, frame generation, reset, and return to the launcher.
 At 90 or 270 degrees, the menu, filter preview bar, layout editor, and FPS HUD
 use a portrait canvas while menu controls keep their normal orientation.
 
-**Settings > Graphics > Low-latency Vulkan** is an optional mode, disabled by
-default. It uses the minimum FIFO swapchain depth and synchronizes DraStic's
+**Settings > Graphics > Renderer > Deko3D (native)** selects direct Horizon
+presentation. It maps the core's completed framebuffer banks for GPU DMA,
+without calling Android `renderFrame`, GLES/EGL, or Vulkan. Both native and
+high-resolution screens, RGB565/RGBA output, all layouts, rotations, built-in
+filters, custom shaders, the stylus cursor, and menu overlays are supported.
+The DS 2D/3D rasterizer remains DraStic's software renderer. See
+[the backend notes](docs/deko3d.md) for the verified ABI and synchronization.
+Deko3D is the default renderer and appears first in the backend selector.
+Existing global and per-game renderer choices are preserved.
+
+**Settings > Graphics > Low latency** controls Deko3D and Vulkan and is enabled
+by default. Existing preferences migrate from the selected backend's old
+setting. Restart the game to apply a change. OpenGL and Zink do not use it.
+With Vulkan, it uses the minimum FIFO swapchain depth and synchronizes DraStic's
 next emulated frame with image acquisition instead of allowing an extra
 completed frame to queue. The dedicated HID sampler continues updating
 controls independently while the renderer waits, so input is not tied to the
-display loop. OpenGL ignores this option.
+display loop.
 
-LSFG 2x Frame Generation is available with the Vulkan renderer under
+With Deko3D, low latency uses
+two swapchain images, following the double-buffering approach described by
+[sa2-nx](https://github.com/ChanseyIsTheBest/sa2-nx/blob/v1.0.3.1/docs/deko3d-renderer-guide.md#8-step-6-pacing-and-input-latency).
+The renderer acquires an image before selecting the newest completed core
+bank, so a captured frame does not grow stale while waiting for scanout.
+This also works with native LSFG: its history is stored separately, and the
+generated and original frames are presented one at a time. Disabling this
+option restores three images, which can give heavy filters more pacing
+headroom. Restart the game after changing it. Gameplay input continues to
+update independently on the one-millisecond HID sampler; emulation/audio
+timing is unchanged. Latency gains still need measurement on Switch hardware.
+
+LSFG 2x Frame Generation is available with Deko3D and Vulkan under
 **Settings > Frame Generation**. You must provide your own `Lossless.dll` at
 `/switch/drastic/lsfg/Lossless.dll`. LSFG must be enabled before launching a
-game so the Vulkan device and swapchain can be prepared; it can then be toggled
-from the in-game menu. For the lowest controller-to-screen latency, leave LSFG
-disabled: generated frames necessarily add presentation latency and its deeper
-swapchain takes precedence over Low-latency Vulkan. Also enable Game Mode on
-the connected TV or monitor when playing docked.
+game so the native compute resources or Vulkan device can be prepared; it can
+then be toggled from the in-game menu. Deko3D extracts and compiles native
+Maxwell compute shaders on the first launch, then reuses its verified cache in
+`/switch/drastic/cache/lsfg-deko3d/`. Changing the DLL, compiler revision,
+Performance mode or flow resolution selects a separate cache. HUD and stylus
+overlays are drawn after interpolation. Performance mode and Quarter flow
+resolution are the defaults.
+
+LSFG generates one intermediate display frame per source frame. It does not
+increase emulation speed and can add artifacts and latency. Its two presents
+per source frame limit source presentation to half the display refresh rate;
+the emulation thread continues independently. Leave it disabled for the lowest
+latency. With Vulkan, its deeper swapchain takes precedence over the Low latency
+setting. Also enable Game Mode on the connected TV or monitor when docked.
 
 Nearest, linear, Quilez, scanline, Scale2x, HQ2x, FXAA, FXAA HQ, and SMAA use
 Drastic's original Android post-FX programs. Native NVC0 and Zink execute the
 generated GLES programs directly. Vulkan executes SPIR-V generated from the
 same `.dfx`/`.dsd` for Scale2x, HQ2x, FXAA, FXAA HQ, and SMAA, and built-in
-equivalents for nearest, linear, Quilez, and scanline.
+equivalents for nearest, linear, Quilez, and scanline. Deko3D uses native Maxwell
+programs compiled from the same original shader sources at build time, with
+the shared presenter's scanline implementation and explicit base-level sampling.
 
 ### Custom shaders
 
@@ -171,17 +206,18 @@ folder tree to `/switch/drastic/shaders/`, then choose **Custom shader** under
 
 OpenGL compiles `.dfx`/`.dsd` sources directly when selected. Vulkan has no
 runtime GLSL compiler, so each custom shader needs an adjacent SPIR-V pack.
-With `glslangValidator` installed, generate it on a PC from this repository:
+Deko3D uses an adjacent native DKSH pack, compiled with devkitPro's `uam`.
+With `glslangValidator` and `uam` installed, generate both on a PC:
 
 ```sh
-python3 tools/compile_custom_shader.py "/path/to/My Shader.dfx"
+python3 tools/compile_custom_shader.py "/path/to/My Shader.dfx" --uam /path/to/uam
 ```
 
 The command validates the OpenGL program and creates
-`My Shader.dfx.nxvk/` beside the manifest. Copy that directory along with the
+`My Shader.dfx.nxvk/` and `My Shader.dfx.nxdk/` beside the manifest. Copy them with the
 `.dfx`, `.dsd`, include, and `.raw` files while preserving relative paths. A
 whole shader directory can be passed instead of one file to compile every
-`.dfx` recursively. The launcher marks missing Vulkan packs and blocks that
+`.dfx` recursively. The launcher marks missing packs for the selected backend and blocks that
 invalid launch instead of silently substituting another filter or renderer.
 
 ### How to build
@@ -189,10 +225,10 @@ invalid launch instead of silently substituting another filter or renderer.
 Install the devkitPro Switch toolchain and portlibs:
 
 ```sh
-pacman -S devkitA64 switch-tools libnx switch-sdl2 switch-sdl2_ttf \
+pacman -S devkitA64 switch-tools libnx deko3d uam switch-sdl2 switch-sdl2_ttf \
           switch-sdl2_image switch-curl switch-ntfs-3g \
           switch-zlib switch-libzstd switch-libexpat switch-cmake \
-          cmake ninja git python \
+          cmake ninja git python python-mako bison flex \
           mingw-w64-ucrt-x86_64-glslang
 ```
 
@@ -218,6 +254,7 @@ JOBS=16 DRASTIC_APK_DIR=/path/to/extracted-apk \
 * TheOfficialFloW for the original Android so-loader lineage.
 * Dantiicu for the Switch Vulkan driver.
 * PancakeTAS for LSFG-VK.
+* PalindromicBreadLoaf and the Dolphin/Cemu/NetherSX2 native LSFG contributors.
 * Slluxx for IconGrabber.
 * jdgleaver and the original RetroArch shader authors for the bundled DraStic
   shader collection; individual source headers retain full attribution.
@@ -239,5 +276,8 @@ other proprietary material unless you have the necessary rights. We do not
 condone piracy.
 
 Unless noted otherwise, the wrapper source is under the MIT License (see
-`LICENSE`). The vendored LSFG-VK subset under `third_party/lsfg-vk` is
-GPL-3.0-or-later.
+`LICENSE`). The vendored LSFG-VK subset under `third_party/lsfg-vk` and native
+LSFG sources under `third_party/lsfg-deko3d` are GPL-3.0-or-later. The native
+integration retains its GPL notices, and `source/deko_compiler` retains the
+GPL-2.0-or-later notices of the Cemu/NetherSX2 compiler bridge. Pinned UAM and
+SPIRV-Cross checkouts retain their individual license files in the build cache.

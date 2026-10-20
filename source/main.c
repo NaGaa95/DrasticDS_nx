@@ -19,6 +19,7 @@
 #include "drastic_config.h"
 #include "drastic_jit.h"
 #include "drastic_renderer.h"
+#include "drastic_native_frame.h"
 #include "drastic_rotation.h"
 #include "error.h"
 #include "imports.h"
@@ -858,12 +859,12 @@ int main(void) {
   setup_directories();
   prefs_init(PREFS_PATH);
   const char *configured_renderer =
-      prefs_get_string("Wrapper/Renderer", "vk");
+      prefs_get_string("Wrapper/Renderer", "deko3d");
   drastic_renderer_select(configured_renderer);
   /* The unified Horizon Mesa EGL archive contains both native NVC0 and Zink.
    * Select the configured backend before the process creates its first EGL
    * display; an EGLDisplay keeps that backend for its entire lifetime. */
-  if (!drastic_renderer_is_vulkan()) {
+  if (drastic_renderer_backend() == DRASTIC_RENDERER_BACKEND_GL) {
     const bool use_zink = !strcmp(configured_renderer, "zink");
     setenv("MESA_SWITCH_GL_DRIVER", use_zink ? "zink" : "nvc0", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", use_zink ? "zink" : "nouveau", 1);
@@ -907,6 +908,9 @@ int main(void) {
   resolve_core();
   if (!drastic_compat_install(&emu_mod))
     fatal_error("Unsupported Drastic ARM64 core compatibility layout.");
+  if (drastic_renderer_is_deko3d() && !drastic_native_frame_install(&emu_mod))
+    fatal_error("Unsupported Drastic ARM64 native framebuffer layout.\n"
+                "Deko3D requires r2.6.0.4a build 109.");
   if (!configure_core_jit(&emu_mod))
     fatal_error("Unsupported Drastic ARM64 core JIT layout.");
   so_finalize(&emu_mod);
@@ -1160,6 +1164,7 @@ int main(void) {
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
   drastic_menu_destroy(menu);
+  drastic_renderer_detach_core();
   shutdown_core(clazz, &game);
   /* Stop DraStic-owned Android service workers while their code and any EGL
    * ownership they hold are still valid. hbloader reuses this process for the

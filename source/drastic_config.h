@@ -6,6 +6,10 @@
 
 #include "drastic_custom_shader.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
   DRASTIC_LAYOUT_VERTICAL,
   DRASTIC_LAYOUT_HORIZONTAL,
@@ -61,7 +65,7 @@ typedef struct {
   int screen_gap;
   int integer_scale;
   int custom_aspect_lock;
-  int vulkan_low_latency;
+  int low_latency;
   DrasticVideoFilter video_filter;
   char custom_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
   int show_fps;
@@ -101,5 +105,9 @@ bool drastic_config_map_touch_rects(const DrasticScreenRect *screens,
 bool drastic_config_map_stylus(const DrasticRuntimeConfig *config,
                                int ds_x, int ds_y,
                                float *panel_x, float *panel_y);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

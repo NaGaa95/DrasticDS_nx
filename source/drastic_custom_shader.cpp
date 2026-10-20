@@ -1,4 +1,5 @@
 #include "drastic_custom_shader.h"
+#include "drastic_dksh.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -346,6 +347,26 @@ static bool spirv_file_ready(const std::string &path, char *error,
   return true;
 }
 
+static bool load_deko_file(const std::string &path, unsigned stage,
+                           uint8_t **destination, size_t *size,
+                           char *error, size_t error_size) {
+  std::vector<uint8_t> bytes;
+  if (!read_file(path, kMaxSpirv, bytes, error, error_size)) return false;
+  if (!drastic_dksh_valid(bytes.data(), bytes.size(), stage)) {
+    set_error(error, error_size, "%s is not a supported native DKSH stage",
+              path.c_str());
+    return false;
+  }
+  *destination = (uint8_t *)std::malloc(bytes.size());
+  if (!*destination) {
+    set_error(error, error_size, "Out of memory loading %s", path.c_str());
+    return false;
+  }
+  std::memcpy(*destination, bytes.data(), bytes.size());
+  *size = bytes.size();
+  return true;
+}
+
 static bool parse_manifest(const std::string &relative, unsigned flags,
                            DrasticCustomShader *shader, char *error,
                            size_t error_size) {
@@ -611,6 +632,27 @@ static bool parse_manifest(const std::string &relative, unsigned flags,
                            &pass.fragment_spirv_size, error, error_size))
         return false;
     }
+    if (flags & DRASTIC_CUSTOM_SHADER_LOAD_DEKO3D) {
+      const std::string pack = full_path(relative) + ".nxdk/pass" +
+                               std::to_string(pass_index);
+      if (!load_deko_file(pack + ".vert.dksh", 0, &pass.vertex_deko3d,
+                          &pass.vertex_deko3d_size, error, error_size) ||
+          !load_deko_file(pack + ".frag.dksh", 4, &pass.fragment_deko3d,
+                          &pass.fragment_deko3d_size, error, error_size))
+        return false;
+    }
+  }
+  if (flags & DRASTIC_CUSTOM_SHADER_LOAD_DEKO3D) {
+    std::string marker;
+    if (!read_text(full_path(relative) + ".nxdk/pack.info", marker,
+                    error, error_size)) return false;
+    const std::string count = "passes=" + std::to_string(shader->pass_count);
+    if (marker.find("format=1\n") == std::string::npos ||
+        marker.find(count + "\n") == std::string::npos) {
+      set_error(error, error_size, "%s has an incomplete native shader pack",
+                relative.c_str());
+      return false;
+    }
   }
   return true;
 }
@@ -643,7 +685,8 @@ static void scan_directory(const std::string &relative, int depth,
     struct stat status{};
     if (stat(path.c_str(), &status) != 0) continue;
     if (S_ISDIR(status.st_mode)) {
-      if (std::strstr(item->d_name, ".nxvk")) continue;
+      if (std::strstr(item->d_name, ".nxvk") ||
+          std::strstr(item->d_name, ".nxdk")) continue;
       scan_directory(child, depth + 1, entries);
       continue;
     }
@@ -660,6 +703,8 @@ static void scan_directory(const std::string &relative, int depth,
     std::snprintf(entry.relative_path, sizeof(entry.relative_path), "%s",
                   child.c_str());
     entry.vulkan_ready = drastic_custom_shader_vulkan_ready(
+        child.c_str(), nullptr, 0);
+    entry.deko3d_ready = drastic_custom_shader_deko3d_ready(
         child.c_str(), nullptr, 0);
     entries.push_back(entry);
     drastic_custom_shader_destroy(&shader);
@@ -701,6 +746,8 @@ extern "C" void drastic_custom_shader_destroy(DrasticCustomShader *shader) {
     std::free(shader->passes[index].fragment_source);
     std::free(shader->passes[index].vertex_spirv);
     std::free(shader->passes[index].fragment_spirv);
+    std::free(shader->passes[index].vertex_deko3d);
+    std::free(shader->passes[index].fragment_deko3d);
   }
   std::memset(shader, 0, sizeof(*shader));
 }
@@ -727,6 +774,15 @@ extern "C" bool drastic_custom_shader_vulkan_ready(
     ready = spirv_file_ready(base + ".vert.spv", error, error_size) &&
             spirv_file_ready(base + ".frag.spv", error, error_size);
   }
+  drastic_custom_shader_destroy(&shader);
+  return ready;
+}
+
+extern "C" bool drastic_custom_shader_deko3d_ready(
+    const char *relative_path, char *error, size_t error_size) {
+  DrasticCustomShader shader{};
+  const bool ready = drastic_custom_shader_load(relative_path,
+      DRASTIC_CUSTOM_SHADER_LOAD_DEKO3D, &shader, error, error_size);
   drastic_custom_shader_destroy(&shader);
   return ready;
 }

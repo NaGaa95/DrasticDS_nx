@@ -78,13 +78,13 @@ static void seed_critical_defaults(void) {
 
 static void seed_defaults(void) {
   seed_critical_defaults();
-  seed("Wrapper/Renderer", "vk");
+  seed("Wrapper/Renderer", "deko3d");
   seed("Wrapper/Layout", "horizontal");
   seed("Wrapper/SwapScreens", "false");
   seed("Wrapper/Rotation", "0");
   seed("Wrapper/ScreenGap", "8");
   seed("Wrapper/IntegerScale", "false");
-  seed("Wrapper/VulkanLowLatency", "false");
+  seed("Wrapper/LowLatency", "true");
   seed("Wrapper/TextureFilter", "nearest");
   seed("Wrapper/VideoFilter", "nearest");
   seed("Wrapper/CustomShader", "");
@@ -242,6 +242,14 @@ void prefs_init(const char *path) {
   if (prefs_contains("Wrapper/LSFGFlowScale"))
     put_entry("Wrapper/LSFGFlowScale", lsfg_flow > 0.375f ? "0.5" : "0.25");
   migrate_stylus_mode();
+  if (!prefs_contains("Wrapper/LowLatency")) {
+    const bool vulkan = !strcmp(prefs_get_string("Wrapper/Renderer", "deko3d"), "vk");
+    const char *legacy = vulkan ? "Wrapper/VulkanLowLatency" : "Wrapper/Deko3DLowLatency";
+    if (prefs_contains(legacy))
+      prefs_set_bool("Wrapper/LowLatency", prefs_get_bool(legacy, true));
+  }
+  prefs_remove("Wrapper/VulkanLowLatency");
+  prefs_remove("Wrapper/Deko3DLowLatency");
   seed_defaults();
   migrate_hotkey_defaults();
   migrate_fast_forward_speed();

@@ -37,6 +37,7 @@
 #include "localization.h"
 #include "SwitchStorage.h"
 #include "ui_audio.h"
+#include "../../source/drastic_dksh.h"
 
 // SDL uses Xbox button names.
 #define BTN_CONFIRM  SDL_CONTROLLER_BUTTON_B
@@ -183,6 +184,21 @@ static bool migrateStylusMode(Store &store, bool addDefault) {
   }
   return changed;
 }
+static bool migrateLowLatency(Store &store,const char *renderer,bool addDefault) {
+  bool changed=false;
+  if(!storeHas(store,"Wrapper/LowLatency")){
+    const bool vulkan=!strcmp(storeGet(store,"Wrapper/Renderer",renderer),"vk");
+    const char *legacy=vulkan?"Wrapper/VulkanLowLatency":"Wrapper/Deko3DLowLatency";
+    if(storeHas(store,legacy)||addDefault){
+      const std::string value=storeGet(store,legacy,"true");
+      storeSet(store,"Wrapper/LowLatency",value.c_str());changed=true;
+    }
+  }
+  for(const char *key:{"Wrapper/VulkanLowLatency","Wrapper/Deko3DLowLatency"})
+    if(storeHas(store,key)){storeRemove(store,key);changed=true;}
+  return changed;
+}
+
 static bool migrateLauncherSettings(Store &store) {
   bool changed = migrateHotkeyDefaults(store);
   // Tabs replace the old transient filter, collection and sort controls.
@@ -190,6 +206,7 @@ static bool migrateLauncherSettings(Store &store) {
     if(storeHas(store,key)){storeRemove(store,key);changed=true;}
   changed = normalizeCpuThreads(store) || changed;
   changed = migrateStylusMode(store,true) || changed;
+  changed = migrateLowLatency(store,"deko3d",true) || changed;
 
   /* The original launcher option was a boolean whose enabled state rendered
      the UI at 90 degrees. Preserve that exact orientation while replacing it
@@ -472,7 +489,7 @@ static void updateAutoFirmwareLanguageLabel() {
            "Auto (%s)", resolved);
 }
 
-static const Choice C_backend[]  = { {"Vulkan (NVK)","vk"}, {"OpenGL (NVC0)","gl"},
+static const Choice C_backend[]  = { {"Deko3D (native)","deko3d"}, {"Vulkan (NVK)","vk"}, {"OpenGL (NVC0)","gl"},
                                      {"Zink (OpenGL on NVK)","zink"} };
 static const Choice C_bool[]     = { {"Off","false"}, {"On","true"} };
 static const Choice C_lsfgFlow[] = { {"Quarter (recommended)","0.25"},
@@ -538,9 +555,8 @@ enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU,
        SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_FIRMWARE, SCR_COUNT };
 
 static const Opt S_graphics[] = {
-  O_CHOICE("Renderer",          "Wrapper/Renderer", C_backend, "vk"),
-  O_CHOICEG("Low-latency Vulkan", "Wrapper/VulkanLowLatency", C_bool,
-            "false", "Wrapper/Renderer", "=vk"),
+  O_CHOICE("Renderer",          "Wrapper/Renderer", C_backend, "deko3d"),
+  O_CHOICE("Low latency", "Wrapper/LowLatency", C_bool, "true"),
   O_CHOICE("Screen layout",     "Wrapper/Layout", C_layout, "horizontal"),
   O_ACTION("Custom layout editor...", "Wrapper/CustomLayoutEditor"),
   O_CHOICE("Lock native aspect ratio", "Wrapper/CustomAspectLock", C_bool, "true"),
@@ -562,7 +578,7 @@ static const Opt S_enhance[] = {
   O_CHOICE("Fix main-engine screen", "Drastic/FixMainEngineScreen", C_bool, "false"),
 };
 static const Opt S_framegen[] = {
-  O_CHOICE("LSFG 2x (Vulkan only)", "Wrapper/LSFGEnabled", C_bool,
+  O_CHOICE("LSFG 2x (Deko3D / Vulkan)", "Wrapper/LSFGEnabled", C_bool,
            "false"),
   O_CHOICEG("Flow resolution", "Wrapper/LSFGFlowScale", C_lsfgFlow,
             "0.25", "Wrapper/LSFGEnabled", "false"),
@@ -686,9 +702,9 @@ struct SettingHelpEntry {
  * them so every launcher option has one contextual source of truth. */
 static const SettingHelpEntry SETTING_HELP[] = {
   {"Wrapper/Renderer", "Display backend",
-   "Chooses the Switch presentation backend. Vulkan (NVK) is recommended for performance and is required by LSFG. OpenGL uses native NVC0, while Zink runs OpenGL on NVK for an additional compatibility path."},
-  {"Wrapper/VulkanLowLatency", "Latency / performance",
-   "Reduces queued Vulkan presentation work so new controller input reaches the display sooner. It can reduce performance headroom, so it is disabled by default."},
+   "Deko3D displays core framebuffers directly. Deko3D and Vulkan support LSFG. OpenGL uses NVC0; Zink runs OpenGL on NVK. Restart the game to change backend."},
+  {"Wrapper/LowLatency", "Latency / performance",
+   "Reduces queued display frames on Deko3D and Vulkan. Enabled by default. Disable if heavy filters cause uneven pacing. Vulkan LSFG requires a deeper queue. Restart the game to apply."},
   {"Wrapper/Layout", "Screen layout",
    "Arranges the two Nintendo DS screens. Hybrid modes enlarge one screen, single-screen modes hide the other, and Custom uses positions saved by either layout editor."},
   {"Wrapper/CustomLayoutEditor", "Screen layout",
@@ -706,7 +722,7 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"Wrapper/VideoFilter", "Post-processing",
    "Applies a GPU scaling filter after DraStic renders the screens. Filters may sharpen, smooth, or stylize the image; Custom uses the shader selected below."},
   {"Wrapper/CustomShader", "Post-processing",
-   "Selects a DraStic .dfx custom shader. Choosing one automatically changes DraStic filter to Custom. Vulkan shaders also need their compiled .dfx.nxvk pack."},
+   "Selects a DraStic .dfx custom shader and enables the Custom filter. Vulkan needs a compiled .dfx.nxvk pack; Deko3D needs a .dfx.nxdk pack. Bundled shaders include both."},
   {"Drastic/ShowFPS", "Performance display",
    "Shows DraStic's on-screen speed and frame-rate indicator while a game is running."},
 
@@ -724,7 +740,7 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Forces the main 2D+3D display engine onto the emulated top screen instead of honoring a game's engine swaps. It helps some games such as the Sonic titles, but can put content on the wrong screen in others."},
 
   {"Wrapper/LSFGEnabled", "Frame generation",
-   "Generates one intermediate frame for each real frame to target a smoother 2x presentation. It does not increase emulation speed and may add artifacts or latency. Vulkan only."},
+   "Generates one intermediate frame per real frame with Deko3D or Vulkan. Requires Lossless.dll and activation before launch. It does not increase emulation speed and can add artifacts or latency."},
   {"Wrapper/LSFGFlowScale", "Frame generation quality",
    "Sets the resolution used for optical-flow analysis. Half can improve motion detail but costs more GPU time and memory; Quarter is recommended on Switch."},
   {"Wrapper/LSFGPerformance", "Frame generation performance",
@@ -4317,6 +4333,7 @@ struct CustomShaderInfo {
   std::string relative;
   int passes=0;
   bool vulkanReady=false;
+  bool dekoReady=false;
 };
 
 static bool readSmallTextFile(const std::string &path,std::string &text) {
@@ -4340,6 +4357,18 @@ static bool spirvFileReady(const std::string &path) {
       magic[0]==0x03&&magic[1]==0x02&&magic[2]==0x23&&magic[3]==0x07;
   fclose(file);
   return ok;
+}
+
+static bool dekoFileReady(const std::string &path,unsigned stage) {
+  FILE *file=fopen(path.c_str(),"rb");
+  if(!file) return false;
+  bool ok=fseek(file,0,SEEK_END)==0;
+  const long length=ok?ftell(file):-1;
+  ok=length>=24&&length<=8*1024*1024&&fseek(file,0,SEEK_SET)==0;
+  std::vector<unsigned char> data(ok?(size_t)length:0);
+  if(ok) ok=fread(data.data(),1,data.size(),file)==data.size();
+  fclose(file);
+  return ok&&drastic_dksh_valid(data.data(),data.size(),stage);
 }
 
 static bool parseCustomShaderInfo(const std::string &absolute,
@@ -4378,6 +4407,16 @@ static bool parseCustomShaderInfo(const std::string &absolute,
       break;
     }
   }
+  const std::string native=absolute+".nxdk/";
+  std::string marker;
+  info.dekoReady=readSmallTextFile(native+"pack.info",marker)&&
+      marker.find("format=1\n")!=std::string::npos&&
+      marker.find("passes="+std::to_string(info.passes)+"\n")!=std::string::npos;
+  for(int pass=0;pass<info.passes&&info.dekoReady;pass++){
+    const std::string base=native+"pass"+std::to_string(pass);
+    info.dekoReady=dekoFileReady(base+".vert.dksh",0)&&
+                  dekoFileReady(base+".frag.dksh",4);
+  }
   if(g_uiTarget && SDL_GetRenderTarget(g_ren)!=g_uiTarget)
     SDL_SetRenderTarget(g_ren,g_uiTarget);
   return true;
@@ -4395,7 +4434,8 @@ static void scanCustomShaderDirectory(const std::string &absolute,
     std::string childRelative=relative.empty()?name:relative+"/"+name;
     struct stat status{}; if(stat(childAbsolute.c_str(),&status)!=0) continue;
     if(S_ISDIR(status.st_mode)){
-      if(name.size()>=5&&!strcasecmp(name.c_str()+name.size()-5,".nxvk")) continue;
+      if(name.size()>=5&&(!strcasecmp(name.c_str()+name.size()-5,".nxvk")||
+                         !strcasecmp(name.c_str()+name.size()-5,".nxdk"))) continue;
       scanCustomShaderDirectory(childAbsolute,childRelative,depth+1,shaders);
     }else if(S_ISREG(status.st_mode)&&name.size()>=4&&
              !strcasecmp(name.c_str()+name.size()-4,".dfx")){
@@ -4445,6 +4485,10 @@ static bool validateCustomShaderSelection(const Store &settings,
       error="Custom shader Vulkan pack is missing";
       return false;
     }
+    if(renderer=="deko3d"&&!shader.dekoReady){
+      error="Custom shader Deko3D pack is missing";
+      return false;
+    }
     return true;
   }
   error="Selected custom .dfx is missing or invalid";
@@ -4457,6 +4501,10 @@ static int choiceIdx(const Opt &o) {
   return -1;
 }
 static bool optEnabled(const Opt &o) {
+  if(o.key&&!strcmp(o.key,"Wrapper/LowLatency")){
+    const char *renderer=iniGet("Wrapper/Renderer","deko3d");
+    return !strcmp(renderer,"deko3d")||!strcmp(renderer,"vk");
+  }
   if(o.type==OT_STATUS) return true;
   if(o.key && !strncmp(o.key,"Wrapper/LSFG",12) && !lsfgDllInstalled())
     return false;
@@ -4907,7 +4955,7 @@ static const char *settingsScreenDescription(int screen) {
   switch(screen){
     case SCR_GRAPHICS: return "Selects the renderer, screen arrangement, scaling, post-processing, FPS display, and DraStic's 3D or visual compatibility options.";
     case SCR_ENHANCE: return "Contains true 3D enhancements alongside performance trade-offs and game-specific display workarounds. Use X Help on each option before changing it.";
-    case SCR_FRAMEGEN: return "Configures Vulkan-only LSFG 2x frame generation. It creates intermediate display frames but does not make Nintendo DS emulation run faster.";
+    case SCR_FRAMEGEN: return "Configures LSFG 2x frame generation for Deko3D and Vulkan. It creates intermediate display frames but does not make Nintendo DS emulation run faster.";
     case SCR_AUDIO: return "Controls emulated sound, output volume, buffering latency, and the simulated Nintendo DS microphone.";
     case SCR_EMU: return "Controls DraStic CPU use, ROM loading, saves, the emulated clock, firmware identity, frame skipping, and fast-forward behavior.";
     case SCR_FRAMERATE: return "Controls frame skipping, fast-forward limits, and auto-fire timing. Frame skipping is a performance trade-off and can break visuals in some games.";
@@ -5071,7 +5119,8 @@ static void chooseCustomShader(const Opt &option) {
                   "/switch/drastic/shaders/"});
     return;
   }
-  const bool vulkan=!strcmp(iniGet("Wrapper/Renderer","vk"),"vk");
+  const bool vulkan=!strcmp(iniGet("Wrapper/Renderer","deko3d"),"vk");
+  const bool deko=!strcmp(iniGet("Wrapper/Renderer","deko3d"),"deko3d");
   std::vector<std::string> labelStorage;
   std::vector<const char*> labels;
   labelStorage.reserve(shaders.size()); labels.reserve(shaders.size());
@@ -5080,6 +5129,7 @@ static void chooseCustomShader(const Opt &option) {
   for(size_t index=0;index<shaders.size();index++){
     std::string label=shaders[index].name;
     if(vulkan&&!shaders[index].vulkanReady) label+="  [Vulkan pack missing]";
+    if(deko&&!shaders[index].dekoReady){ label+="  "; label+=tr("[Deko3D pack missing]"); }
     labelStorage.push_back(std::move(label));
     if(!strcmp(shaders[index].relative.c_str(),configured)) current=(int)index;
   }
@@ -5087,6 +5137,12 @@ static void chooseCustomShader(const Opt &option) {
   int selected=dropdown("Custom DraStic shader",labels.data(),
                         (int)labels.size(),current);
   if(selected<0||selected>=(int)shaders.size()) return;
+  if(deko&&!shaders[selected].dekoReady){
+    modalMessage("Deko3D shader pack missing",
+                 {shaders[selected].name,
+                  "Install the compiled .dfx.nxdk folder beside the shader."});
+    return;
+  }
   if(vulkan&&!shaders[selected].vulkanReady){
     modalMessage("Vulkan shader pack missing",
                  {shaders[selected].name,
@@ -6308,7 +6364,7 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       } else if(global&&index==framegenRow){
         drawSettingsRowText(LauncherLocalization::Translate("Frame Generation").data(),
-                            "LSFG 2x / Vulkan",slot,colW,labelX,valX,current,
+                            "LSFG 2x",slot,colW,labelX,valX,current,
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,rowH);
       } else {
         drawSettingsRowText(
@@ -7184,6 +7240,7 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
   else g_game.kv.clear();
   normalizeCpuThreads(g_game);
   migrateStylusMode(g_game,false);
+  migrateLowLatency(g_game,storeGet(g_global,"Wrapper/Renderer","deko3d"),false);
   storeRemove(g_game,"Wrapper/CpuBoost");
   beginScreenFx();
   for(;;){
@@ -7416,6 +7473,10 @@ static bool bundledShadersPresent() {
        !regularFileExists(pack+"/pack.info")||
        !regularFileExists(pack+"/pass0.vert.spv")||
        !regularFileExists(pack+"/pass0.frag.spv")) return false;
+    const std::string native=dfx+".nxdk";
+    if(!regularFileExists(native+"/pack.info")||
+       !regularFileExists(native+"/pass0.vert.dksh")||
+       !regularFileExists(native+"/pass0.frag.dksh")) return false;
   }
   return true;
 }
@@ -8115,7 +8176,7 @@ int main(int argc, char **argv){
     storeSet(g_global,"Wrapper/LauncherRotation","0");
     storeSet(g_global,"Wrapper/GridColumns","6");
     storeSet(g_global,"Wrapper/GridRows","2");
-    storeSet(g_global,"Wrapper/Renderer","vk");
+    storeSet(g_global,"Wrapper/Renderer","deko3d");
     storeSet(g_global,"Wrapper/AnalogDeadzone","35");
     storeSet(g_global,"Wrapper/ShowGameTitles","true");
     storeSet(g_global,"Wrapper/ShowRegionFlags","true");
@@ -8534,6 +8595,7 @@ int main(int argc, char **argv){
       if(!regularFileExists(profile)&&launchLegacyUnique&&!launchLegacyKey.empty()) profile=std::string(GAMECFG_DIR)+"/"+launchLegacyKey+".ini";
       Store overrides; storeLoad(overrides,profile.c_str());
       migrateStylusMode(overrides,false);
+      migrateLowLatency(overrides,storeGet(g_global,"Wrapper/Renderer","deko3d"),false);
       storeRemove(overrides,"Wrapper/CpuBoost");
       for(const auto &entry:overrides.kv)
         if(runtimeConfigKey(entry.k)&&!runtimeOwnedKey(entry.k))
@@ -8542,10 +8604,11 @@ int main(int argc, char **argv){
     normalizeLsfgStore(effective);
     normalizeCpuThreads(effective);
     /* Renderer remains a per-game option. The unified host reads this merged
-       profile and selects Vulkan, native NVC0 or Zink at process startup. */
-    const char *configuredRenderer=storeGet(effective,"Wrapper/Renderer","vk");
-    std::string renderer=!strcmp(configuredRenderer,"gl")?"gl":
-                         !strcmp(configuredRenderer,"zink")?"zink":"vk";
+       profile and selects Deko3D, Vulkan, native NVC0 or Zink at startup. */
+    const char *configuredRenderer=storeGet(effective,"Wrapper/Renderer","deko3d");
+    std::string renderer=!strcmp(configuredRenderer,"vk")?"vk":
+                         !strcmp(configuredRenderer,"gl")?"gl":
+                         !strcmp(configuredRenderer,"zink")?"zink":"deko3d";
     std::string shaderError;
     const bool shaderReady=validateCustomShaderSelection(
         effective,renderer,shaderError);
@@ -8594,9 +8657,9 @@ int main(int argc, char **argv){
     const bool lsfgRequested=!strcmp(
         storeGet(effective,"Wrapper/LSFGEnabled","false"),"true");
     const char *lsfgWarning=nullptr;
-    if(lsfgRequested&&renderer!="vk"){
-      // LSFG is a Vulkan-only presentation feature.  Keep the user's saved
-      // preference intact for Vulkan, but silently disable it in the merged
+    if(lsfgRequested&&renderer!="vk"&&renderer!="deko3d"){
+      // LSFG requires a native compute backend. Keep the user's saved
+      // preference intact for supported backends, but disable it in the merged
       // launch profile when native OpenGL or Zink is selected.
       storeSet(effective,"Wrapper/LSFGEnabled","false");
     } else if(lsfgRequested&&!lsfgDllInstalled()){
