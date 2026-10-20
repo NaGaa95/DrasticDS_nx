@@ -68,6 +68,9 @@ typedef struct {
   int low_latency;
   DrasticVideoFilter video_filter;
   char custom_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
+  char background[1024];
+  char background_cache[1024];
+  int background_fit; /* 0 = contain, 1 = fill, 2 = stretch */
   int show_fps;
   int volume;
   int microphone_enabled;

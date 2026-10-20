@@ -88,6 +88,8 @@ static void seed_defaults(void) {
   seed("Wrapper/TextureFilter", "nearest");
   seed("Wrapper/VideoFilter", "nearest");
   seed("Wrapper/CustomShader", "");
+  seed("Wrapper/Background", "");
+  seed("Wrapper/BackgroundFit", "contain");
   seed("Wrapper/LSFGEnabled", "false");
   seed("Wrapper/LSFGFlowScale", "0.25");
   seed("Wrapper/LSFGPerformance", "true");
@@ -275,14 +277,23 @@ void prefs_save(void) {
 }
 
 void prefs_save_runtime_key(const char *key) {
+  prefs_save_runtime_keys(&key,1);
+}
+
+void prefs_save_runtime_keys(const char *const *keys, size_t count) {
   prefs_save();
-  if (!key || !*key) return;
+  if (!keys || !count) return;
   const char *profile = prefs_get_string("Wrapper/GameConfigPath", "");
   static const char allowed_root[] = DATA_ROOT "/gamecfg/";
   if (strncmp(profile, allowed_root, sizeof(allowed_root) - 1) ||
       strstr(profile, "..")) return;
-  const int entry = find_entry(key);
-  if (entry < 0) return;
+  bool selected[PREFS_MAX_ENTRIES]={false}, replaced[PREFS_MAX_ENTRIES]={false};
+  bool any=false;
+  for (size_t i=0;i<count;i++) {
+    const int entry=find_entry(keys[i]);
+    if (entry>=0) selected[entry]=any=true;
+  }
+  if (!any) return;
 
   char temporary[1200];
   snprintf(temporary, sizeof(temporary), "%s.tmp", profile);
@@ -292,7 +303,6 @@ void prefs_save_runtime_key(const char *key) {
     if (input) fclose(input);
     return;
   }
-  int replaced = 0;
   char line[2048];
   while (input && fgets(line, sizeof(line), input)) {
     char copy[sizeof(line)];
@@ -303,15 +313,18 @@ void prefs_save_runtime_key(const char *key) {
       *equals = '\0';
       candidate = trim(candidate);
     }
-    if (equals && !strcmp(candidate, key)) {
-      fprintf(output, "%s = %s\n", key, entries[entry].value);
-      replaced = 1;
+    const int entry=equals ? find_entry(candidate) : -1;
+    if (entry>=0 && selected[entry]) {
+      if (!replaced[entry]) fprintf(output, "%s = %s\n", entries[entry].key, entries[entry].value);
+      replaced[entry] = true;
     } else {
       fputs(line, output);
     }
   }
   if (input) fclose(input);
-  if (!replaced) fprintf(output, "%s = %s\n", key, entries[entry].value);
+  for (int entry=0;entry<entry_count;entry++)
+    if (selected[entry] && !replaced[entry])
+      fprintf(output,"%s = %s\n",entries[entry].key,entries[entry].value);
   int failed = fflush(output) != 0;
   if (fclose(output) != 0) failed = 1;
   if (failed) {

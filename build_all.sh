@@ -226,6 +226,15 @@ cp -f "$BUNDLED_CHEAT_LICENSE/COPYING" \
 echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan + Deko3D) ===="
 mkdir -p "$ROMFS_STAGE/shaders"
 cp -a "$BUNDLED_SHADER_SOURCE/." "$ROMFS_STAGE/shaders/"
+mkdir -p "$ROMFS_STAGE/backgrounds/licenses/pocketarch"
+cp -f "$APP/third_party/backgrounds/pngkey-ds/Nintendo-DS.png" "$ROMFS_STAGE/backgrounds/Nintendo DS.png"
+cp -f "$APP/third_party/backgrounds/pngkey-ds/Nintendo-DS.png.layout" "$ROMFS_STAGE/backgrounds/Nintendo DS.png.layout"
+cp -f "$APP/third_party/backgrounds/pngkey-ds/NOTICE.md" "$ROMFS_STAGE/backgrounds/licenses/PNGkey-DS-NOTICE.md"
+mkdir -p "$ROMFS_STAGE/backgrounds/lnkd"
+cp -f "$APP/third_party/backgrounds/lnkd/"*.png "$APP/third_party/backgrounds/lnkd/"*.layout "$ROMFS_STAGE/backgrounds/lnkd/"
+cp -f "$APP/third_party/backgrounds/lnkd/NOTICE.md" "$ROMFS_STAGE/backgrounds/licenses/lnkd-NOTICE.md"
+cp -f "$APP/third_party/backgrounds/NOTICE.md" "$ROMFS_STAGE/backgrounds/NOTICE.md"
+cp -f "$APP/third_party/backgrounds/pocketarch/LICENSE" "$ROMFS_STAGE/backgrounds/licenses/pocketarch/LICENSE"
 "$PYTHON3" "$APP/tools/compile_custom_shader.py" \
   "$ROMFS_STAGE/shaders" --glslang "$GLSLANG" --uam "$UAM"
 

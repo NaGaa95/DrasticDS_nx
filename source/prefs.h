@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 void prefs_init(const char *ini_path);
 
@@ -13,6 +14,8 @@ void prefs_save(void);
 /* Saves the effective launch config and mirrors one runtime-adjustable value
  * into the active per-title profile, when the launcher supplied one. */
 void prefs_save_runtime_key(const char *key);
+/* Writes the launch config and per-title profile once for a related edit. */
+void prefs_save_runtime_keys(const char *const *keys, size_t count);
 
 // lookups: return the stored value, or `def` on miss. `key` is the flat
 // "Section/Key" string the SharedPreferences shim passes through.

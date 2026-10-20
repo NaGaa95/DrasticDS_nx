@@ -1,5 +1,7 @@
 #include "drastic_renderer.h"
 #include "drastic_deko_renderer.h"
+#include "drastic_background.h"
+#include "config.h"
 
 #include <string.h>
 
@@ -67,6 +69,7 @@ const char *drastic_renderer_backend_name(void) {
 }
 
 bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
+  drastic_background_init(config);
   if (drastic_renderer_is_deko3d()) return drastic_deko_renderer_init(config);
   return drastic_renderer_is_vulkan() ? drastic_vk_renderer_init(config)
                                       : drastic_gl_renderer_init(config);
@@ -77,6 +80,7 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               void *env, void *clazz,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame) {
+  overlay = drastic_background_compose(config, panel_width, panel_height, overlay);
   if (drastic_renderer_is_deko3d())
     drastic_deko_renderer_present(config, core_render, env, clazz, overlay,
                                   consume_core_frame);
@@ -101,6 +105,7 @@ void drastic_renderer_resume(void) {
 }
 
 void drastic_renderer_shutdown(void) {
+  drastic_background_shutdown();
   if (drastic_renderer_is_deko3d()) { drastic_deko_renderer_shutdown(); return; }
   if (drastic_renderer_is_vulkan()) drastic_vk_renderer_shutdown();
   else drastic_gl_renderer_shutdown();

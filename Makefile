@@ -86,6 +86,7 @@ LIBS	:= -Wl,-u,vk_icdGetInstanceProcAddr \
 		-l:libGLESv2.a -l:libEGL.a -l:libvulkan.a -l:libglapi.a \
 		-l:libmesa_util_c11.a -l:libblake3.a -l:libmesa_util.a \
 		-l:libmesa_util_simd.a -l:libxmlconfig.a \
+		`$(PREFIX)pkg-config --libs SDL2_image` \
 		-lelf -lexpat -lzstd -lz -ldeko3d -lnx -lstdc++ -lm \
 		-Wl,--end-group
 

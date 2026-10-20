@@ -11,6 +11,8 @@
 
 #include "config.h"
 #include "drastic_renderer.h"
+#include "drastic_background.h"
+#include "drastic_background_files.h"
 #include "ingame_menu.h"
 #include "jni_fake.h"
 #include "opensles.h"
@@ -30,6 +32,7 @@ enum MenuPage {
   MENU_CHEATS,
   MENU_DISPLAY,
   MENU_FILTER_PICKER,
+  MENU_BACKGROUND_PICKER,
   MENU_EMULATION,
   MENU_AUDIO_INPUT,
   MENU_LAYOUT_EDITOR,
@@ -76,6 +79,11 @@ struct DrasticIngameMenu {
   int filter_picker_index;
   int filter_picker_custom;
   int filter_picker_valid;
+  DrasticBackgroundEntry *backgrounds;
+  int background_count, background_index, background_valid;
+  DrasticBackgroundLoader *background_loader;
+  const DrasticBackgroundImage *background_backup_image;
+  DrasticRuntimeConfig background_backup;
   u64 marquee_tick;
   u64 analog_nav_direction;
   u64 analog_nav_since;
@@ -187,11 +195,6 @@ static void save_int(const char *key, int value) {
 
 static void save_string(const char *key, const char *value) {
   prefs_set_string(key, value);
-  prefs_save_runtime_key(key);
-}
-
-static void save_float(const char *key, float value) {
-  prefs_set_float(key, value);
   prefs_save_runtime_key(key);
 }
 
@@ -820,11 +823,10 @@ static const char *filter_picker_label(const DrasticIngameMenu *menu) {
       : "Not selected";
 }
 
-static void render_filter_picker(DrasticIngameMenu *menu) {
+static void render_preview_picker(DrasticIngameMenu *menu, const char *kind, const char *label) {
   char selection[160];
   snprintf(selection, sizeof(selection), "%s   <  %s  >",
-           menu->filter_picker_custom ? "Custom shader" : "Filter",
-           filter_picker_label(menu));
+           kind, label);
 
   /* Keep the game unobstructed while previewing filters. The overlay buffer
    * is transparent outside this compact, opaque control bar. */
@@ -848,13 +850,28 @@ static void render_filter_picker(DrasticIngameMenu *menu) {
                               COLOR_WARN, menu->status);
 }
 
+static void render_filter_picker(DrasticIngameMenu *menu) {
+  render_preview_picker(menu,menu->filter_picker_custom ? "Custom shader" : "Filter",filter_picker_label(menu));
+}
+
+static const char *background_label(const char *path) {
+  static const char *paths[]={"","builtin:white","builtin:pink","builtin:navy","builtin:black"};
+  static const char *names[]={"None","PocketArch - White","PocketArch - Coral pink","PocketArch - Enamel navy","PocketArch - Black"};
+  for (int i=0;i<5;i++) if (!strcmp(path,paths[i])) return names[i];
+  const char *slash=strrchr(path,'/'); return slash ? slash+1 : path;
+}
+
+static const char *background_fit_label(int fit) {
+  return fit==1 ? "Fill" : fit==2 ? "Stretch" : "Contain";
+}
+
 static void render_display(DrasticIngameMenu *menu) {
   static const char *labels[] = {
     "Screen layout", "Swap DS screens", "Rotation", "Screen gap",
     "Integer scaling", "Drastic filter", "Custom shader",
-    "Custom layout editor", "Back"
+    "Custom layout editor", "Background / bezel", "Background fit", "Back"
   };
-  char values[9][112] = {{0}};
+  char values[11][112] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%s", layout_label(menu->config->layout));
   snprintf(values[1], sizeof(values[1]), "%s", menu->config->swap_screens ? "On" : "Off");
   snprintf(values[2], sizeof(values[2]), "%d degrees", (menu->config->rotation & 3) * 90);
@@ -864,22 +881,24 @@ static void render_display(DrasticIngameMenu *menu) {
            filter_label(menu->config->video_filter));
   snprintf(values[6], sizeof(values[6]), "%s",
            custom_shader_name(menu, menu->config->custom_shader));
+  snprintf(values[8],sizeof(values[8]),"%s",background_label(menu->config->background));
+  snprintf(values[9],sizeof(values[9]),"%s",background_fit_label(menu->config->background_fit));
   draw_shell("Screen layout & filters",
              "Left / Right  Change     A  Select     B  Back");
   const int panel_x = ui_is_portrait() ? 24 : 156;
   const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
   overlay_fill_rect(panel_x, 102, panel_width, 518, COLOR_PANEL);
-  for (int index = 0; index < 9; index++) {
+  for (int index = 0; index < 11; index++) {
     const int row_x = panel_x + 24;
-    const int row_y = 122 + index * 52;
+    const int row_y = 122 + index * 44;
     const int row_width = panel_width - 48;
     const int selected = menu->selection[MENU_DISPLAY] == index;
-    if (index == 6)
+    if (index == 6 || index == 8)
       draw_row_scrolling_value(row_x, row_y, row_width, selected,
                                labels[index], values[index], 1);
     else
       draw_row(row_x, row_y, row_width, selected, labels[index],
-               index < 7 ? values[index] : NULL, 1);
+               index != 7 && index < 10 ? values[index] : NULL, 1);
   }
   draw_status(menu);
 }
@@ -1174,6 +1193,8 @@ static void render_menu(DrasticIngameMenu *menu) {
     case MENU_CHEATS: render_cheats(menu); break;
     case MENU_DISPLAY: render_display(menu); break;
     case MENU_FILTER_PICKER: render_filter_picker(menu); break;
+    case MENU_BACKGROUND_PICKER:
+      render_preview_picker(menu,"Background",menu->backgrounds[menu->background_index].name); break;
     case MENU_EMULATION: render_emulation(menu); break;
     case MENU_AUDIO_INPUT: render_audio_input(menu); break;
     case MENU_LAYOUT_EDITOR: render_layout_editor(menu); break;
@@ -1519,15 +1540,134 @@ static void update_filter_picker(DrasticIngameMenu *menu, u64 pressed) {
     preview_filter(menu, 1);
 }
 
+static const char *sd_path(const char *path) {
+  return !strncmp(path,"sdmc:",5) ? path+5 : path;
+}
+
+static void save_custom_layout(DrasticIngameMenu *menu);
+static void set_custom_layout_preferences(DrasticIngameMenu *menu);
+static const char *const background_keys[]={
+  "Wrapper/Background", "Wrapper/Rotation", "Wrapper/BackgroundFit",
+  "Wrapper/CustomTopX", "Wrapper/CustomTopY", "Wrapper/CustomTopW", "Wrapper/CustomTopH",
+  "Wrapper/CustomBottomX", "Wrapper/CustomBottomY", "Wrapper/CustomBottomW", "Wrapper/CustomBottomH",
+  "Wrapper/CustomAspectLock", "Wrapper/Layout"
+};
+
+static void preview_background(DrasticIngameMenu *menu) {
+  if (!menu->background_loader)
+    menu->background_loader=drastic_background_loader_create(CACHE_DIR "/backgrounds");
+  if (!menu->background_loader) {
+    menu->background_valid=0; set_status(menu,"Could not prepare the background image."); return;
+  }
+  menu->background_valid=0;
+  drastic_background_loader_request(menu->background_loader,&menu->background_backup,
+      menu->backgrounds[menu->background_index].path);
+  set_status(menu,"Preparing background");
+}
+
+static void poll_background(DrasticIngameMenu *menu) {
+  if (!menu->background_loader) return;
+  DrasticRuntimeConfig candidate;
+  const DrasticBackgroundImage *image=NULL;
+  char error[192]={0};
+  const int status=drastic_background_loader_poll(menu->background_loader,&candidate,&image,error,sizeof(error));
+  if (!status) return;
+  menu->background_valid=status>0 && drastic_background_set_cached_image(&candidate,image);
+  drastic_background_image_release(image);
+  if (menu->background_valid) {
+    *menu->config=candidate;
+    overlay_set_rotation(menu->config->rotation);
+    drastic_config_calculate_layout(menu->config,panel_width,panel_height);
+  }
+  set_status(menu,menu->background_valid ? "" : *error?error:"Could not prepare the background image.");
+}
+
+static void begin_background_picker(DrasticIngameMenu *menu,int direction) {
+  free(menu->backgrounds);
+  menu->backgrounds=calloc(513,sizeof(*menu->backgrounds));
+  if (!menu->backgrounds) { set_status(menu,"Could not prepare the background image."); return; }
+  static const char *styles[]={"","builtin:white","builtin:pink","builtin:navy","builtin:black"};
+  for (int i=0;i<5;i++) {
+    snprintf(menu->backgrounds[i].path,sizeof(menu->backgrounds[i].path),"%s",styles[i]);
+    snprintf(menu->backgrounds[i].name,sizeof(menu->backgrounds[i].name),"%s",background_label(styles[i]));
+  }
+  menu->background_count=5+(int)drastic_background_scan(DATA_ROOT "/backgrounds",menu->backgrounds+5,507);
+  menu->background_index=-1;
+  for (int i=0;i<menu->background_count;i++)
+    if (!strcmp(sd_path(menu->backgrounds[i].path),sd_path(menu->config->background))) menu->background_index=i;
+  if (menu->background_index<0) {
+    const int i=menu->background_count++;
+    snprintf(menu->backgrounds[i].path,sizeof(menu->backgrounds[i].path),"%s",menu->config->background);
+    snprintf(menu->backgrounds[i].name,sizeof(menu->backgrounds[i].name),"%s",background_label(menu->config->background));
+    menu->background_index=i;
+  }
+  menu->background_backup=*menu->config;
+  drastic_background_image_release(menu->background_backup_image);
+  menu->background_backup_image=drastic_background_acquire_current_image();
+  menu->background_valid=1;
+  select_page(menu,MENU_BACKGROUND_PICKER);
+  if (direction) {
+    menu->background_index=(menu->background_index+direction+menu->background_count)%menu->background_count;
+    preview_background(menu);
+  }
+}
+
+static int restore_background(DrasticIngameMenu *menu) {
+  DrasticRuntimeConfig backup=menu->background_backup;
+  drastic_background_loader_cancel(menu->background_loader);
+  if (!drastic_background_set_cached_image(&backup,menu->background_backup_image)) {
+    set_status(menu,"Could not restore the previous background."); return 0;
+  }
+  *menu->config=backup;
+  overlay_set_rotation(menu->config->rotation);
+  drastic_config_calculate_layout(menu->config,panel_width,panel_height);
+  return 1;
+}
+
+static void finish_background_picker(DrasticIngameMenu *menu) {
+  drastic_background_loader_cancel(menu->background_loader);
+  drastic_background_image_release(menu->background_backup_image); menu->background_backup_image=NULL;
+  free(menu->backgrounds); menu->backgrounds=NULL; menu->background_count=0;
+  select_page(menu,MENU_DISPLAY);
+}
+
+static void update_background_picker(DrasticIngameMenu *menu,u64 pressed) {
+  poll_background(menu);
+  if (pressed & HidNpadButton_B) {
+    if (restore_background(menu)) finish_background_picker(menu);
+  } else if (pressed & HidNpadButton_A) {
+    if (!menu->background_valid) { set_status(menu,"This background could not be loaded"); return; }
+    prefs_set_string("Wrapper/BackgroundCache",menu->config->background_cache);
+    prefs_set_string("Wrapper/Background",menu->config->background);
+    DrasticRuntimeConfig preset={0};
+    if (drastic_background_apply_layout(&preset,menu->config->background)) {
+      set_custom_layout_preferences(menu);
+      prefs_set_int("Wrapper/Rotation",menu->config->rotation);
+      prefs_set_string("Wrapper/BackgroundFit",menu->config->background_fit==2?"stretch":
+                  menu->config->background_fit==1?"fill":"contain");
+      prefs_save_runtime_keys(background_keys,sizeof(background_keys)/sizeof(*background_keys));
+    } else prefs_save_runtime_key("Wrapper/Background");
+    finish_background_picker(menu);
+  } else if (pressed & (HidNpadButton_Left|HidNpadButton_Right)) {
+    const int direction=pressed&HidNpadButton_Left ? -1 : 1;
+    menu->background_index=(menu->background_index+direction+menu->background_count)%menu->background_count;
+    preview_background(menu);
+  }
+}
+
 static void update_display(DrasticIngameMenu *menu, u64 pressed) {
-  navigate_list(menu, 9, pressed);
+  navigate_list(menu, 11, pressed);
   if (pressed & HidNpadButton_B) {
     select_page(menu, MENU_MAIN);
     return;
   }
   const int selection = menu->selection[MENU_DISPLAY];
-  if (selection == 8 && (pressed & HidNpadButton_A)) {
+  if (selection == 10 && (pressed & HidNpadButton_A)) {
     select_page(menu, MENU_MAIN);
+    return;
+  }
+  if (selection == 8 && (pressed & (HidNpadButton_A|HidNpadButton_Left|HidNpadButton_Right))) {
+    begin_background_picker(menu,pressed&HidNpadButton_Left ? -1 : pressed&HidNpadButton_Right ? 1 : 0);
     return;
   }
   if (selection == 7 && (pressed & HidNpadButton_A)) {
@@ -1575,6 +1715,12 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
       menu->config->integer_scale ^= 1;
       save_bool("Wrapper/IntegerScale", menu->config->integer_scale);
       break;
+    case 9: {
+      menu->config->background_fit=(menu->config->background_fit+direction+3)%3;
+      static const char *fits[]={"contain","fill","stretch"};
+      save_string("Wrapper/BackgroundFit",fits[menu->config->background_fit]);
+      break;
+    }
     default: return;
   }
   drastic_config_calculate_layout(menu->config, panel_width, panel_height);
@@ -1727,7 +1873,7 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
   menu->redraw = 1;
 }
 
-static void save_custom_layout(DrasticIngameMenu *menu) {
+static void set_custom_layout_preferences(DrasticIngameMenu *menu) {
   static const char *keys[2][4] = {
     {"Wrapper/CustomTopX", "Wrapper/CustomTopY",
      "Wrapper/CustomTopW", "Wrapper/CustomTopH"},
@@ -1736,14 +1882,19 @@ static void save_custom_layout(DrasticIngameMenu *menu) {
   };
   for (int screen = 0; screen < 2; screen++) {
     const DrasticScreenRect *rect = &menu->config->custom_screens[screen];
-    save_float(keys[screen][0], rect->x);
-    save_float(keys[screen][1], rect->y);
-    save_float(keys[screen][2], rect->width);
-    save_float(keys[screen][3], rect->height);
+    prefs_set_float(keys[screen][0], rect->x);
+    prefs_set_float(keys[screen][1], rect->y);
+    prefs_set_float(keys[screen][2], rect->width);
+    prefs_set_float(keys[screen][3], rect->height);
   }
-  save_bool("Wrapper/CustomAspectLock",
+  prefs_set_bool("Wrapper/CustomAspectLock",
             menu->config->custom_aspect_lock);
-  save_string("Wrapper/Layout", "custom");
+  prefs_set_string("Wrapper/Layout", "custom");
+}
+
+static void save_custom_layout(DrasticIngameMenu *menu) {
+  set_custom_layout_preferences(menu);
+  prefs_save_runtime_keys(background_keys+3,sizeof(background_keys)/sizeof(*background_keys)-3);
 }
 
 static float normalized_axis(int value) {
@@ -1853,6 +2004,9 @@ DrasticIngameMenu *drastic_menu_create(DrasticRuntimeConfig *config,
 void drastic_menu_destroy(DrasticIngameMenu *menu) {
   if (!menu) return;
   free_cheats(menu);
+  free(menu->backgrounds);
+  drastic_background_loader_destroy(menu->background_loader);
+  drastic_background_image_release(menu->background_backup_image);
   jni_release_int_array(menu->snapshot_top_array);
   jni_release_int_array(menu->snapshot_bottom_array);
   free(menu);
@@ -1872,6 +2026,10 @@ void drastic_menu_open(DrasticIngameMenu *menu) {
 
 void drastic_menu_close(DrasticIngameMenu *menu, bool resume_core) {
   if (!menu || !menu->open) return;
+  if (menu->page==MENU_BACKGROUND_PICKER) {
+    if (!restore_background(menu)) return;
+    finish_background_picker(menu);
+  }
   menu->open = 0;
   overlay_hide();
   if (resume_core && menu->core.pause_system)
@@ -1884,6 +2042,7 @@ bool drastic_menu_is_open(const DrasticIngameMenu *menu) {
 
 static void update_marquee(DrasticIngameMenu *menu) {
   const int active = menu->page == MENU_DISPLAY ||
+      menu->page == MENU_BACKGROUND_PICKER ||
       (menu->page == MENU_FILTER_PICKER && menu->filter_picker_custom);
   if (!active) {
     menu->marquee_tick = 0;
@@ -1925,6 +2084,7 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
     case MENU_CHEATS: update_cheats(menu, pressed); break;
     case MENU_DISPLAY: update_display(menu, pressed); break;
     case MENU_FILTER_PICKER: update_filter_picker(menu, pressed); break;
+    case MENU_BACKGROUND_PICKER: update_background_picker(menu, pressed); break;
     case MENU_EMULATION: update_emulation(menu, pressed); break;
     case MENU_AUDIO_INPUT: update_audio_input(menu, pressed); break;
     case MENU_LAYOUT_EDITOR:

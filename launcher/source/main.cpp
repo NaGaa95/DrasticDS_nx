@@ -38,6 +38,8 @@
 #include "SwitchStorage.h"
 #include "ui_audio.h"
 #include "../../source/drastic_dksh.h"
+#include "../../source/drastic_background.h"
+#include "../../source/drastic_background_files.h"
 
 // SDL uses Xbox button names.
 #define BTN_CONFIRM  SDL_CONTROLLER_BUTTON_B
@@ -57,6 +59,7 @@ static const char *USER_DIR   = "sdmc:/switch/drastic/user";
 static const char *CACHE_DIR  = "sdmc:/switch/drastic/cache";
 static const char *METADATA_INI = "sdmc:/switch/drastic/cache/library_metadata.ini";
 static const char *SHADERS_DIR= "sdmc:/switch/drastic/shaders";
+static const char *BACKGROUNDS_DIR= "sdmc:/switch/drastic/backgrounds";
 static const char *BUNDLED_SHADERS_DIR=
     "sdmc:/switch/drastic/shaders/Bundled";
 static const char *LSFG_DIR   = "sdmc:/switch/drastic/lsfg";
@@ -199,8 +202,18 @@ static bool migrateLowLatency(Store &store,const char *renderer,bool addDefault)
   return changed;
 }
 
+static bool retireDSLogoBackground(Store &store) {
+  const char *path=storeGet(store,"Wrapper/Background","");
+  if(!strncmp(path,"sdmc:",5))path+=5;
+  if(strcmp(path,"/switch/drastic/backgrounds/Bundled/DS Logo.png"))return false;
+  storeSet(store,"Wrapper/Background","");
+  storeRemove(store,"Wrapper/BackgroundCache");
+  return true;
+}
+
 static bool migrateLauncherSettings(Store &store) {
   bool changed = migrateHotkeyDefaults(store);
+  changed = retireDSLogoBackground(store) || changed;
   // Tabs replace the old transient filter, collection and sort controls.
   for(const char *key:{"Wrapper/Theme","Wrapper/SortMode","Library/ActiveCollection","Library/Search"})
     if(storeHas(store,key)){storeRemove(store,key);changed=true;}
@@ -432,7 +445,7 @@ static const char *iniGet(const char *key, const char *def) {
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
 
 enum OType { OT_CHOICE, OT_RANGE, OT_SUBMENU, OT_TEXT,
-             OT_HOTKEY, OT_STATUS, OT_SHADER, OT_DATETIME, OT_ACTION };
+             OT_HOTKEY, OT_STATUS, OT_SHADER, OT_BACKGROUND, OT_DATETIME, OT_ACTION };
 struct Choice { const char *label, *val; };
 struct Opt {
   const char *label;
@@ -455,6 +468,7 @@ struct Opt {
 #define O_HOTKEYG(l,k,d,gk,go) { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, gk, go }
 #define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr }
 #define O_SHADER(l,k,d)        { l, k, OT_SHADER, nullptr,0, 0,0,0, d, 0, nullptr, nullptr }
+#define O_BACKGROUND(l,k,d)    { l, k, OT_BACKGROUND, nullptr,0, 0,0,0, d, 0, nullptr, nullptr }
 #define O_DATETIMEG(l,k,d,gk,go) { l, k, OT_DATETIME, nullptr,0, 0,0,0, d, 0, gk, go }
 #define O_ACTION(l,k)           { l, k, OT_ACTION, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr }
 
@@ -492,6 +506,7 @@ static void updateAutoFirmwareLanguageLabel() {
 static const Choice C_backend[]  = { {"Deko3D (native)","deko3d"}, {"Vulkan (NVK)","vk"}, {"OpenGL (NVC0)","gl"},
                                      {"Zink (OpenGL on NVK)","zink"} };
 static const Choice C_bool[]     = { {"Off","false"}, {"On","true"} };
+static const Choice C_backgroundFit[] = { {"Contain","contain"}, {"Fill","fill"}, {"Stretch","stretch"} };
 static const Choice C_lsfgFlow[] = { {"Quarter (recommended)","0.25"},
                                      {"Half","0.5"} };
 static const Choice C_layout[]   = { {"Vertical","vertical"}, {"Horizontal","horizontal"},
@@ -566,6 +581,8 @@ static const Opt S_graphics[] = {
   O_CHOICE("Integer scaling",   "Wrapper/IntegerScale", C_bool, "false"),
   O_CHOICE("Drastic filter",       "Wrapper/VideoFilter", C_filter, "nearest"),
   O_SHADER("Custom shader...",     "Wrapper/CustomShader", ""),
+  O_BACKGROUND("Background / bezel...", "Wrapper/Background", ""),
+  O_CHOICE("Background fit", "Wrapper/BackgroundFit", C_backgroundFit, "contain"),
   O_CHOICE("Show FPS",          "Drastic/ShowFPS", C_bool, "false"),
   O_SUB   ("3D and display options...", SCR_ENHANCE),
 };
@@ -723,6 +740,10 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Applies a GPU scaling filter after DraStic renders the screens. Filters may sharpen, smooth, or stylize the image; Custom uses the shader selected below."},
   {"Wrapper/CustomShader", "Post-processing",
    "Selects a DraStic .dfx custom shader and enables the Custom filter. Vulkan needs a compiled .dfx.nxvk pack; Deko3D needs a .dfx.nxdk pack. Bundled shaders include both."},
+  {"Wrapper/Background", "Gameplay artwork",
+   "Selects an adaptive DS bezel or an image behind gameplay. Import PNG, JPEG, WebP or BMP from SD, USB or SMB, or copy images to /switch/drastic/backgrounds/. Game screens stay unobstructed in every layout. Supports per-game overrides."},
+  {"Wrapper/BackgroundFit", "Gameplay artwork",
+   "Contain preserves the whole image with empty borders; Fill crops it to cover the display; Stretch fills without preserving its shape. Artwork follows gameplay rotation. Adaptive bezels fit the screen layout automatically."},
   {"Drastic/ShowFPS", "Performance display",
    "Shows DraStic's on-screen speed and frame-rate indicator while a game is running."},
 
@@ -907,7 +928,7 @@ static void commitAll() {
       const Opt &o = g_screens[s].opts[i];
       if (o.key && (o.type == OT_CHOICE || o.type == OT_RANGE ||
                     o.type == OT_TEXT || o.type == OT_HOTKEY ||
-                    o.type == OT_SHADER || o.type == OT_DATETIME)) {
+                    o.type == OT_SHADER || o.type == OT_BACKGROUND || o.type == OT_DATETIME)) {
         std::string v = iniGet(o.key, o.def);
         iniSet(o.key, v.c_str());
       }
@@ -1363,7 +1384,8 @@ static void toast(const char *msg, Uint32 durationMs=1800);
 static void modalMessage(const char *title, const std::vector<std::string> &lines);
 static bool confirmBox(const char *title, const std::vector<std::string> &lines);
 static int dropdown(const char *title, const char *const *labels, int n, int cur,
-                    const SDL_Color *swatches=nullptr);
+                    const SDL_Color *swatches=nullptr,
+                    const std::function<void(const SDL_Rect&,int)> &preview={});
 static void beginScreenFx();
 static void drawFadeIn();
 static void listCol(int *colX,int *colW,int *labelX,int *valX);
@@ -2269,6 +2291,7 @@ static bool launcherOnlyWrapperKey(const std::string &key) {
 static bool runtimeOwnedKey(const std::string &key) {
   return key=="Wrapper/CoreSo"||key=="Wrapper/LauncherPath"||
          key=="Wrapper/GameKey"||key=="Wrapper/GameConfigPath"||
+         key=="Wrapper/BackgroundCache"||
          key=="Wrapper/CpuBoost"||key=="Drastic/RomPath";
 }
 static bool runtimeConfigKey(const std::string &key) {
@@ -4324,6 +4347,230 @@ static std::string browseCoverImage(const std::string &start) {
   return runFileBrowser(start,BrowserMode::SelectImage);
 }
 
+static const Choice BACKGROUND_STYLES[] = {
+  {"None", ""}, {"PocketArch - White", "builtin:white"},
+  {"PocketArch - Coral pink", "builtin:pink"},
+  {"PocketArch - Enamel navy", "builtin:navy"},
+  {"PocketArch - Black", "builtin:black"},
+};
+
+static std::string backgroundValue(const char *value) {
+  for(const auto &style:BACKGROUND_STYLES)
+    if(!strcmp(value,style.val)) return style.label;
+  return fileNameOf(value);
+}
+
+static bool runCoverImportTask(const char *title,const std::string &detail,
+                               const std::function<void(const std::atomic_bool&)> &task);
+
+using BackgroundSurface=std::unique_ptr<SDL_Surface,decltype(&SDL_FreeSurface)>;
+static BackgroundSurface loadBackgroundImage(const std::string &path,std::string &error) {
+  char reason[192]={0};
+  BackgroundSurface image{drastic_background_image_load(path.c_str(),reason,sizeof(reason)),SDL_FreeSurface};
+  if(!image)error=reason;
+  return image;
+}
+
+static bool backgroundFingerprint(const std::string &path,uint64_t &hash) {
+  FILE *file=fopen(path.c_str(),"rb"); if(!file) return false;
+  unsigned char bytes[16384]; size_t count,total=0;
+  hash=14695981039346656037ULL;
+  while((count=fread(bytes,1,sizeof(bytes),file))!=0){
+    total+=count; if(total>32u*1024*1024){fclose(file);return false;}
+    for(size_t i=0;i<count;i++){hash^=bytes[i];hash*=1099511628211ULL;}
+  }
+  const bool ok=total && !ferror(file); fclose(file); return ok;
+}
+
+static bool prepareBackground(Store &settings,std::string &error,bool cachedOnly=false) {
+  storeRemove(settings,"Wrapper/BackgroundCache");
+  const std::string path=storeGet(settings,"Wrapper/Background","");
+  for(const auto &style:BACKGROUND_STYLES) if(path==style.val) return true;
+  const std::string directory=std::string(CACHE_DIR)+"/backgrounds";
+  char destination[1024],reason[192]={0};
+  if(cachedOnly){
+    if(!drastic_background_find_prepared(path.c_str(),directory.c_str(),destination,sizeof(destination)))return false;
+    storeSet(settings,"Wrapper/BackgroundCache",toEmu(destination).c_str());return true;
+  }
+  mkdir(CACHE_DIR,0777);
+  if(!drastic_background_prepare_image(path.c_str(),directory.c_str(),destination,sizeof(destination),reason,sizeof(reason))){
+    error=reason;return false;
+  }
+  storeSet(settings,"Wrapper/BackgroundCache",toEmu(destination).c_str());
+  return true;
+}
+
+static bool importBackground(const std::string &selected,std::string &destination,
+                              std::string &error,const std::atomic_bool &cancel) {
+  uint64_t hash;
+  if(!backgroundFingerprint(selected,hash)){
+    error="Background image is missing or exceeds 32 MiB.";return false;
+  }
+  auto image=loadBackgroundImage(selected,error); if(!image || cancel.load()) return false;
+  mkdir(BACKGROUNDS_DIR,0777);
+  const std::string directory=std::string(BACKGROUNDS_DIR)+"/User";
+  mkdir(directory.c_str(),0777);
+  char suffix[32];snprintf(suffix,sizeof(suffix),"-%016llx.png",(unsigned long long)hash);
+  destination=directory+"/"+sanitize(fileNameOf(selected)).substr(0,80)+suffix;
+  const std::string temporary=destination+".tmp";
+  if(!recoverAtomicFile(destination) || IMG_SavePNG(image.get(),temporary.c_str())!=0){
+    remove(temporary.c_str());error="Could not save the background image.";return false;
+  }
+  FILE *file=fopen(temporary.c_str(),"rb+");
+  bool ok=file!=nullptr;
+  if(file){if(fsync(fileno(file))!=0)ok=false;if(fclose(file)!=0)ok=false;}
+  if(cancel.load() || !ok || !replaceAtomic(destination,temporary)){
+    remove(temporary.c_str());error="Could not save the background image.";return false;
+  }
+  DrasticRuntimeConfig preset{};
+  if(drastic_background_apply_layout(&preset,selected.c_str())){
+    char text[256];const auto &a=preset.custom_screens[0],&b=preset.custom_screens[1];
+    snprintf(text,sizeof(text),"NXBGLAYOUT2 %d\n%.9g %.9g %.9g %.9g\n%.9g %.9g %.9g %.9g\n",
+      preset.rotation,a.x,a.y,a.width,a.height,b.x,b.y,b.width,b.height);
+    if(!writeAtomicText(destination+".layout",text)){
+      error="Could not save the background image.";return false;
+    }
+  }
+  return true;
+}
+
+static void scanBackgrounds(const std::string &directory,int,std::vector<std::string> &paths) {
+  std::vector<DrasticBackgroundEntry> entries(512);
+  const size_t count=drastic_background_scan(directory.c_str(),entries.data(),entries.size());
+  for(size_t i=0;i<count;i++)paths.push_back(entries[i].path);
+}
+
+static DrasticBackgroundLoader *g_backgroundPreviewLoader;
+
+class BezelPreview {
+  std::string selected,problem;
+  std::unique_ptr<SDL_Texture,decltype(&SDL_DestroyTexture)> texture{nullptr,SDL_DestroyTexture};
+  DrasticRuntimeConfig config{};
+  bool loading=false;
+public:
+  ~BezelPreview(){drastic_background_loader_cancel(g_backgroundPreviewLoader);drastic_background_shutdown();}
+  void draw(const SDL_Rect &area,const std::string &path){
+    if(path!=selected || !config.screen_count){
+      selected=path;texture.reset();problem.clear();config={};loading=false;
+      config.rotation=std::clamp(atoi(iniGet("Wrapper/Rotation","0")),0,3);
+      config.screen_gap=std::clamp(atoi(iniGet("Wrapper/ScreenGap","8")),0,128);
+      config.integer_scale=!strcmp(iniGet("Wrapper/IntegerScale","false"),"true");
+      config.swap_screens=!strcmp(iniGet("Wrapper/SwapScreens","false"),"true");
+      config.custom_aspect_lock=!strcmp(iniGet("Wrapper/CustomAspectLock","true"),"true");
+      const char *layout=iniGet("Wrapper/Layout","horizontal");
+      const char *layouts[]={"vertical","horizontal","top","bottom","hybrid_top","hybrid_bottom","custom"};
+      config.layout=DRASTIC_LAYOUT_HORIZONTAL;
+      for(int i=0;i<7;i++)if(!strcmp(layout,layouts[i]))config.layout=(DrasticLayoutMode)i;
+      const char *keys[2][4]={{"Wrapper/CustomTopX","Wrapper/CustomTopY","Wrapper/CustomTopW","Wrapper/CustomTopH"},
+        {"Wrapper/CustomBottomX","Wrapper/CustomBottomY","Wrapper/CustomBottomW","Wrapper/CustomBottomH"}};
+      const char *defaults[2][4]={{"0.03","0.20666667","0.44","0.58666667"},{"0.53","0.20666667","0.44","0.58666667"}};
+      for(int i=0;i<2;i++){
+        float values[4];for(int j=0;j<4;j++){
+          values[j]=std::strtof(iniGet(keys[i][j],defaults[i][j]),nullptr);
+          if(!std::isfinite(values[j]))values[j]=std::strtof(defaults[i][j],nullptr);
+          values[j]=std::clamp(values[j],j<2?0.0f:0.08f,1.0f);
+        }
+        config.custom_screens[i]={values[0],values[1],std::min(values[2],1.0f-values[0]),
+          std::min(values[3],1.0f-values[1]),i,i};
+      }
+      drastic_config_calculate_layout(&config,1280,720);
+      const std::string fit=iniGet("Wrapper/BackgroundFit","contain");
+      config.background_fit=fit=="fill"?1:fit=="stretch"?2:0;
+      if(path!="@import"){
+        if(!g_backgroundPreviewLoader)g_backgroundPreviewLoader=drastic_background_loader_create(nullptr);
+        if(g_backgroundPreviewLoader){
+          drastic_background_loader_request(g_backgroundPreviewLoader,&config,path.c_str());loading=true;
+        }else problem="Could not prepare the background image.";
+      }else drastic_background_loader_cancel(g_backgroundPreviewLoader);
+    }
+    if(loading){
+      DrasticRuntimeConfig ready{};const DrasticBackgroundImage *image=nullptr;char error[192]={0};
+      const int status=drastic_background_loader_poll(g_backgroundPreviewLoader,&ready,&image,error,sizeof(error));
+      if(status){
+        loading=false;
+        if(status>0 && drastic_background_set_cached_image(&ready,image)){
+          config=ready;drastic_config_calculate_layout(&config,1280,720);
+          const auto *frame=drastic_background_compose(&config,1280,720,nullptr);
+          if(frame && frame->pixels){
+            texture.reset(SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STATIC,frame->width,frame->height));
+            if(texture){SDL_UpdateTexture(texture.get(),nullptr,frame->pixels,frame->width*4);SDL_SetTextureBlendMode(texture.get(),SDL_BLENDMODE_NONE);}
+          }
+        }else problem=*error?error:"Could not prepare the background image.";
+        drastic_background_image_release(image);
+      }
+    }
+    int width=area.w,height=width*9/16;
+    if(height>area.h-56){height=std::max(1,area.h-56);width=height*16/9;}
+    const SDL_Rect display={area.x+(area.w-width)/2,area.y+(area.h-height)/2,width,height};
+    fillRect(display.x,display.y,display.w,display.h,{0,0,0,255});
+    if(texture){
+      const int w=config.rotation&1?height:width,h=config.rotation&1?width:height;
+      const SDL_Rect dest={display.x+(width-w)/2,display.y+(height-h)/2,w,h};
+      SDL_RenderCopyEx(g_ren,texture.get(),nullptr,&dest,config.rotation*90.0,nullptr,SDL_FLIP_NONE);
+    }
+    if(path!="@import"&&problem.empty()&&!loading)for(int i=0;i<config.screen_count;i++){
+      const auto &r=config.screens[i];
+      const SDL_Rect screen={display.x+(int)(r.x*width/1280),display.y+(int)(r.y*height/720),
+        std::max(1,(int)(r.width*width/1280)),std::max(1,(int)(r.height*height/720))};
+      fillRect(screen.x,screen.y,screen.w,screen.h,r.screen?SDL_Color{25,44,47,255}:SDL_Color{24,35,53,255});
+      border(screen.x,screen.y,screen.w,screen.h,1,{88,111,129,255});
+      const char *name=tr(r.screen?"Touch screen":"Top screen");
+      if(textW(g_font_sm,name)<screen.w-8&&fontHeight(g_font_sm)<screen.h)
+        drawText(g_font_sm,screen.x+(screen.w-textW(g_font_sm,name))/2,
+          screen.y+(screen.h-fontHeight(g_font_sm))/2,name,COL_TXT);
+    }
+    border(display.x,display.y,width,height,1,COL_DIM);
+    const std::string label=path=="@import"?tr("Import background image..."):
+      !problem.empty()?tr("Background image failed"):loading?tr("Preparing background"):tr("Bezel preview");
+    drawWrappedCentered(g_font_sm,area.x+area.w/2,display.y+height+14,area.w,fontHeight(g_font_sm)+4,2,label.c_str(),COL_DIM);
+  }
+};
+
+static void applyBackgroundLayout(const std::string &path) {
+  DrasticRuntimeConfig preset{};
+  if(!drastic_background_apply_layout(&preset,path.c_str()))return;
+  const char *keys[2][4]={{"Wrapper/CustomTopX","Wrapper/CustomTopY","Wrapper/CustomTopW","Wrapper/CustomTopH"},
+    {"Wrapper/CustomBottomX","Wrapper/CustomBottomY","Wrapper/CustomBottomW","Wrapper/CustomBottomH"}};
+  for(int i=0;i<2;i++){
+    const auto &r=preset.custom_screens[i];const float values[]={r.x,r.y,r.width,r.height};
+    for(int j=0;j<4;j++){char text[32];snprintf(text,sizeof(text),"%.9g",values[j]);iniSet(keys[i][j],text);}
+  }
+  iniSet("Wrapper/Layout","custom");iniSet("Wrapper/CustomAspectLock","false");
+  char rotation[8];snprintf(rotation,sizeof(rotation),"%d",preset.rotation);
+  iniSet("Wrapper/Rotation",rotation);iniSet("Wrapper/BackgroundFit","stretch");
+}
+
+static void chooseBackground(const Opt &option) {
+  std::vector<std::string> paths,labels;
+  for(const auto &style:BACKGROUND_STYLES){paths.push_back(style.val);labels.push_back(tr(style.label));}
+  std::vector<std::string> images;scanBackgrounds(BACKGROUNDS_DIR,0,images);
+  std::sort(images.begin(),images.end());
+  for(const auto &path:images){paths.push_back(path);labels.push_back(path.substr(strlen(BACKGROUNDS_DIR)+1));}
+  labels.push_back(tr("Import background image..."));
+  std::vector<const char*> choices;int current=-1;
+  const std::string configured=iniGet(option.key,option.def);
+  for(size_t i=0;i<labels.size();i++){
+    choices.push_back(labels[i].c_str());if(i<paths.size()&&toEmu(paths[i])==toEmu(configured))current=(int)i;
+  }
+  BezelPreview preview;
+  const int selected=dropdown(tr("Background / bezel..."),choices.data(),(int)choices.size(),current,nullptr,
+    [&](const SDL_Rect &area,int index){preview.draw(area,index<(int)paths.size()?paths[index]:"@import");});
+  if(selected<0)return;
+  if(selected<(int)paths.size()){
+    iniSet(option.key,paths[selected].c_str());applyBackgroundLayout(paths[selected]);
+  }
+  else{
+    const std::string source=browseCoverImage(BACKGROUNDS_DIR);if(source.empty())return;
+    std::string path,error;bool ok=false;
+    if(!runCoverImportTask("Preparing background",fileNameOf(source),[&](const std::atomic_bool &cancel){
+      ok=importBackground(source,path,error,cancel);
+    }))return;
+    if(!ok){modalMessage(tr("Background image failed"),{std::string(LauncherLocalization::Translate(error))});return;}
+    iniSet(option.key,path.c_str());
+    applyBackgroundLayout(path);
+  }
+}
+
 static void runFileManager() {
   runFileBrowser({},BrowserMode::Manage);
 }
@@ -4533,6 +4780,7 @@ static void optValue(const Opt &o, char *out, int n) {
   else if (o.type==OT_HOTKEY){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"None"); }
   else if (o.type==OT_STATUS) snprintf(out,n,"%s",lsfgDllInstalled()?"Installed":"Missing");
   else if (o.type==OT_SHADER) snprintf(out,n,"%s",customShaderValue(iniGet(o.key,o.def)).c_str());
+  else if (o.type==OT_BACKGROUND) snprintf(out,n,"%s",backgroundValue(iniGet(o.key,o.def)).c_str());
   else if (o.type==OT_DATETIME) {
     struct tm value{};
     if(localTimeFromMillis(iniGet(o.key,o.def),value))
@@ -4575,7 +4823,7 @@ static bool canResetOption(const Opt &o) {
   return o.key && o.def &&
          (o.type==OT_CHOICE || o.type==OT_RANGE ||
           o.type==OT_TEXT || o.type==OT_HOTKEY ||
-          o.type==OT_SHADER || o.type==OT_DATETIME);
+          o.type==OT_SHADER || o.type==OT_BACKGROUND || o.type==OT_DATETIME);
 }
 static bool canAdjustOption(const Opt &o) {
   return optEnabled(o) &&
@@ -4987,7 +5235,7 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     char v[256]; optValue(S.opts[i],v,sizeof(v));
     const std::string value=std::string(LauncherLocalization::Translate(v));
     drawSettingsRowText(LauncherLocalization::Translate(S.opts[i].label).data(),value.c_str(),slotY,colW,labelX,valX,
-                        cur,lc,vc,S.opts[i].type==OT_SHADER);
+                        cur,lc,vc,S.opts[i].type==OT_SHADER || S.opts[i].type==OT_BACKGROUND);
     if(S.opts[i].key && !strcmp(S.opts[i].key,"Drastic/FirmwareColor")){
       int colorIndex=choiceIdx(S.opts[i]);
       if(colorIndex>=0 && colorIndex<(int)(sizeof(C_firmwareColorRgb)/sizeof(*C_firmwareColorRgb))){
@@ -5031,15 +5279,18 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
 }
 
 static int dropdown(const char *title, const char *const *labels, int n, int cur,
-                    const SDL_Color *swatches) {
+                    const SDL_Color *swatches,
+                    const std::function<void(const SDL_Rect&,int)> &preview) {
   if(n<1) return cur;
   int sel = (cur < 0 || cur >= n) ? 0 : cur, top = 0;
   // One source of truth for the panel geometry: the draw code and the hit test
   // used to recompute it with different formulas and could disagree.
   const int rowH = settingsRowH()+8;
   const int vis = std::min(n,std::max(1,(SH-240)/rowH));
-  const int pw = std::min(900,SW-64), ph = 140+vis*rowH;
+  const int pw = preview?std::min(1160,SW-48):std::min(900,SW-64), ph = 140+vis*rowH;
+  const int listWidth=preview?pw*3/5:pw;
   const int px = (SW-pw)/2, py = (SH-ph)/2, ly = py+80;
+  if(sel>=vis)top=sel-vis+1;
   beginScreenFx();
   for (;;) {
     if(!beginUiFrame()) return -1;
@@ -5049,10 +5300,13 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
         if(touchScrollList(tk,sel,top,n,vis)) continue;
-        if(tk==TOUCH_TAP && tx>=px+8 && tx<px+pw-8){
+        if(tk==TOUCH_TAP && tx>=px+8 && tx<px+listWidth-8){
           for(int r=0;r<vis&&top+r<n;r++){
             const int y=ly+r*rowH;
-            if(ty>=y&&ty<y+rowH) return top+r;
+            if(ty>=y&&ty<y+rowH){
+              if(preview&&sel!=top+r){sel=top+r;break;}
+              return top+r;
+            }
           }
         } }
       if (e.type != SDL_CONTROLLERBUTTONDOWN) continue;
@@ -5072,7 +5326,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
     fillRect(px+28,py+66,pw-56,1,(SDL_Color){255,255,255,24});
     for(int r=0;r<vis && top+r<n;r++){
       const int i=top+r, y=ly+r*rowH; const bool curr=(i==sel);
-      if(curr) drawRowHighlight(px+8,y,pw-16,rowH-4);
+      if(curr) drawRowHighlight(px+8,y,listWidth-16,rowH-4);
       int textX=px+32;
       const int textY=y+(rowH-fontHeight(g_font))/2;
       if(swatches){
@@ -5082,7 +5336,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
                      (SDL_Color){225,230,240,255},6);
         textX+=swatchSize+14;
       }
-      const int textWidth=px+pw-44-textX;
+      const int textWidth=px+listWidth-44-textX;
       if(curr)
         drawScrollTextL(g_font,textX,textY,textWidth,labels[i],COL_VAL);
       else
@@ -5091,9 +5345,10 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
     }
     if(n>vis){
       const int height=vis*rowH, thumb=std::max(12,height*vis/n);
-      fillRect(px+pw-18,ly,3,height,COL_CARD);
-      fillRect(px+pw-18,ly+(height-thumb)*top/(n-vis),3,thumb,COL_SEL);
+      fillRect(px+listWidth-18,ly,3,height,COL_CARD);
+      fillRect(px+listWidth-18,ly+(height-thumb)*top/(n-vis),3,thumb,COL_SEL);
     }
+    if(preview)preview({px+listWidth+12,ly,pw-listWidth-36,vis*rowH},sel);
     FootItem footer[]={{"A","Select",FA_NONE},{"B","Back",FA_NONE}};
     drawFooterHints(footer,2,py+ph-28);
     drawFadeIn();
@@ -5280,6 +5535,18 @@ static LayoutEditorCanvas layoutEditorCanvas(){
 }
 
 static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
+  const std::string background=iniGet("Wrapper/Background","");
+  std::string imageError;
+  BackgroundSurface backgroundImage{nullptr,SDL_FreeSurface};
+  if(!background.empty()&&background.rfind("builtin:",0)!=0)
+    backgroundImage=loadBackgroundImage(background,imageError);
+  std::unique_ptr<SDL_Texture,decltype(&SDL_DestroyTexture)> backgroundTexture{
+      backgroundImage?SDL_CreateTextureFromSurface(g_ren,backgroundImage.get()):nullptr,
+      SDL_DestroyTexture};
+  const int imageWidth=backgroundImage?backgroundImage->w:0;
+  const int imageHeight=backgroundImage?backgroundImage->h:0;
+  backgroundImage.reset();
+  if(backgroundTexture)SDL_SetTextureBlendMode(backgroundTexture.get(),SDL_BLENDMODE_BLEND);
   const std::string editorTitle=
       std::string(LauncherLocalization::Translate("Custom screen layout"));
   const std::string editorScope=std::string(LauncherLocalization::Translate(
@@ -5387,6 +5654,30 @@ static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
     glassPanel(canvasX-8,canvasY-8,canvasWidth+16,canvasHeight+16);
     roundedPanel(canvasX,canvasY,canvasWidth,canvasHeight,(SDL_Color){7,10,15,255},
                  (SDL_Color){75,88,105,255},4,2);
+    if(backgroundTexture){
+      const bool portrait=rotation&1;
+      const int logicalWidth=portrait?canvasHeight:canvasWidth;
+      const int logicalHeight=portrait?canvasWidth:canvasHeight;
+      double sx=(double)logicalWidth/imageWidth,sy=(double)logicalHeight/imageHeight;
+      const std::string fit=iniGet("Wrapper/BackgroundFit","contain");
+      if(fit!="stretch")sx=sy=fit=="fill"?std::max(sx,sy):std::min(sx,sy);
+      const int width=std::max(1,(int)std::lround(imageWidth*sx));
+      const int height=std::max(1,(int)std::lround(imageHeight*sy));
+      const SDL_Rect destination={canvasX+(canvasWidth-width)/2,
+        canvasY+(canvasHeight-height)/2,width,height};
+      const SDL_Rect clip={canvasX,canvasY,canvasWidth,canvasHeight};
+      SDL_Rect previousClip{};SDL_RenderGetClipRect(g_ren,&previousClip);
+      const bool clipped=SDL_RenderIsClipEnabled(g_ren);
+      SDL_RenderSetClipRect(g_ren,&clip);
+      SDL_RenderCopyEx(g_ren,backgroundTexture.get(),nullptr,&destination,
+                        rotation*90.0,nullptr,SDL_FLIP_NONE);
+      SDL_RenderSetClipRect(g_ren,clipped?&previousClip:nullptr);
+    }else if(background.rfind("builtin:",0)==0){
+      const SDL_Color color=background=="builtin:white"?SDL_Color{245,245,245,255}:
+        background=="builtin:pink"?SDL_Color{246,198,192,255}:
+        background=="builtin:navy"?SDL_Color{43,56,86,255}:SDL_Color{34,34,34,255};
+      fillRect(canvasX,canvasY,canvasWidth,canvasHeight,color);
+    }
 
     for(int pass=0;pass<2;pass++){
       const int screen=pass==1?selected:1-selected;
@@ -5610,6 +5901,7 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
             beginScreenFx();
           }
           else if(o.type==OT_SHADER){ chooseCustomShader(o); beginScreenFx(); }
+          else if(o.type==OT_BACKGROUND){ chooseBackground(o); beginScreenFx(); }
           else if(o.type==OT_DATETIME){ editCustomClock(o); beginScreenFx(); }
           else if(o.type==OT_TEXT){
             if(optEnabled(o)){
@@ -7239,6 +7531,7 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
   else if(g.legacyUnique&&!g.legacyKey.empty()&&regularFileExists(legacyGp)) storeLoad(g_game,legacyGp.c_str());
   else g_game.kv.clear();
   normalizeCpuThreads(g_game);
+  retireDSLogoBackground(g_game);
   migrateStylusMode(g_game,false);
   migrateLowLatency(g_game,storeGet(g_global,"Wrapper/Renderer","deko3d"),false);
   storeRemove(g_game,"Wrapper/CpuBoost");
@@ -7956,6 +8249,9 @@ static void cleanupLauncher() {
   // The worker may still be decoding an SD image into a software surface.  It
   // must finish before game records and SDL_image are torn down.
   stopCoverDecodeWorker();
+  drastic_background_loader_destroy(g_backgroundPreviewLoader);g_backgroundPreviewLoader=nullptr;
+  drastic_background_shutdown();
+  drastic_background_cache_clear();
   if(g_ren) SDL_SetRenderTarget(g_ren,nullptr);
   for(auto &game:g_games) releaseGameArtwork(game);
   clearTextCaches();
@@ -8220,6 +8516,13 @@ int main(int argc, char **argv){
   }
   if(!ensureBundledShaders())
     return startupFailure("Could not install the bundled custom shaders.");
+  mkdir(BACKGROUNDS_DIR,0777);
+  /* Retire only the app-installed logo from earlier builds. User artwork
+   * with the same filename in another folder remains available. */
+  remove((std::string(BACKGROUNDS_DIR)+"/Bundled/DS Logo.png").c_str());
+  remove((std::string(BACKGROUNDS_DIR)+"/Bundled/licenses/ds-logo/LICENSE").c_str());
+  if(!extractTree("romfs:/backgrounds",std::string(BACKGROUNDS_DIR)+"/Bundled",false))
+    return startupFailure("Could not install the bundled backgrounds.");
   startCoverDecodeWorker();
 
   std::string positionalForwarderPath;
@@ -8602,6 +8905,7 @@ int main(int argc, char **argv){
           storeSet(effective,entry.k.c_str(),entry.v.c_str());
     }
     normalizeLsfgStore(effective);
+    retireDSLogoBackground(effective);
     normalizeCpuThreads(effective);
     /* Renderer remains a per-game option. The unified host reads this merged
        profile and selects Deko3D, Vulkan, native NVC0 or Zink at startup. */
@@ -8612,6 +8916,14 @@ int main(int argc, char **argv){
     std::string shaderError;
     const bool shaderReady=validateCustomShaderSelection(
         effective,renderer,shaderError);
+    std::string backgroundError;
+    bool backgroundReady=true;
+    const std::string background=storeGet(effective,"Wrapper/Background","");
+    if(!prepareBackground(effective,backgroundError,true) &&
+        !runCoverImportTask("Preparing background",backgroundValue(background.c_str()),
+        [&](const std::atomic_bool &cancel){
+      if(!cancel.load())backgroundReady=prepareBackground(effective,backgroundError);
+    })){backgroundReady=false;backgroundError="Background preparation cancelled.";}
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     std::string coreSource="romfs:/cores/libdrastic_arm64.so";
     std::string coreDestination=std::string(CORES_DIR)+"/libdrastic_arm64.so";
@@ -8668,12 +8980,13 @@ int main(int argc, char **argv){
     }
     bool configSaved=storeSave(effective,EMU_INI);
     willChain=haveCore&&haveEmulator&&haveResources&&haveSystemFiles&&
-              configSaved&&shaderReady;
+              configSaved&&shaderReady&&backgroundReady;
     if(willChain&&lsfgWarning){
       modalMessage("Launch warning",{lsfgWarning});
     } else if(!willChain){
       std::string failure;
       if(!shaderReady) failure=shaderError;
+      else if(!backgroundReady) failure=std::string(LauncherLocalization::Translate(backgroundError));
       else if(!haveSystemFiles) failure="Missing DS BIOS/firmware in /switch/drastic/system";
       else if(!haveResources) failure="Could not extract Drastic resources (SD full?)";
       else if(!haveCore||!haveEmulator) failure="Could not extract emulator files (SD full?)";

@@ -149,6 +149,46 @@ The DS 2D/3D rasterizer remains DraStic's software renderer. See
 Deko3D is the default renderer and appears first in the backend selector.
 Existing global and per-game renderer choices are preserved.
 
+**Settings > Graphics > Background / bezel...** selects gameplay artwork,
+independently of the Classic launcher background. Included presets provide
+four adaptive PocketArch DS bezel colors and the hardware skins below. The adaptive
+presets follow every layout, including single-screen, hybrid, custom and
+rotated layouts. Artwork never covers the game screens or changes touch input.
+
+Use **Import background image...** to select PNG, JPEG, WebP or BMP from SD,
+USB or SMB storage. Imports are validated and saved on SD, so the original
+drive does not need to stay connected. Alternatively, put images in
+`/switch/drastic/backgrounds/`; subdirectories are supported. **Background fit**
+offers Contain, Fill and Stretch. For a bezel with fixed screen openings, use
+the **Custom layout editor...**: it previews the selected image behind the
+screen rectangles so you can align them. These options support per-game
+overrides; select None to disable artwork, or reset the row to inherit global
+settings in a game profile.
+
+The background picker shows the highlighted bezel on the right, with the
+current screen layout. The Nintendo DS hardware bezel from PNGkey and lnkd's
+DS Phat Silver / Analogue Black variants include matched screen-layout presets;
+selecting one applies those screen positions and the appropriate rotation.
+
+During a game, open **L + R + Plus → Screen layout & filters → Background / bezel**.
+Use Left/Right to preview backgrounds directly over the paused game, A to apply
+and save for this title, or B to restore the previous background and layout.
+The **Background fit** row also updates immediately. Custom images copied into
+`/switch/drastic/backgrounds/` appear in this picker without returning to the
+launcher, including images that have never been selected before.
+
+Image files are limited to 32 MiB / 16 megapixels and resized to a maximum
+1920-pixel edge when imported. A 128 MiB RAM cache retains decoded images, with
+the active bezel and the picker's Cancel target pinned while in use. First-time
+decoding and disk-cache preparation run on a worker so both background pickers
+remain responsive; rapid navigation replaces queued requests. Once prepared,
+boot checks the source file's path, size and timestamps instead of hashing the
+PNG again, and skips the preparation screen when the disk cache is current.
+Applying a matched layout saves its settings together. The emulator updates the cached overlay
+only when the layout or UI changes and uses the existing overlay pass on all
+backends. Native Deko3D LSFG keeps artwork and menus outside interpolation.
+See [artwork sources and licenses](third_party/backgrounds/NOTICE.md).
+
 **Settings > Graphics > Low latency** controls Deko3D and Vulkan and is enabled
 by default. Existing preferences migrate from the selected backend's old
 setting. Restart the game to apply a change. OpenGL and Zink do not use it.

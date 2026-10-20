@@ -214,6 +214,14 @@ def package_shaders(nro: Path, output: Path) -> None:
                 native_count += 1
     hosts = [blob for path, blob in entries.items() if path.endswith('/DrasticDS_nx.nro')]
     assert len(hosts) == 1 and b'Deko3D initialized:' in hosts[0]
+    assert 'backgrounds/DS Logo.png' not in entries
+    assert not any(path.startswith('backgrounds/licenses/ds-logo/') for path in entries)
+    assert entries['backgrounds/licenses/pocketarch/LICENSE'] == (ROOT / 'third_party/backgrounds/pocketarch/LICENSE').read_bytes()
+    assert entries['backgrounds/NOTICE.md'] == (ROOT / 'third_party/backgrounds/NOTICE.md').read_bytes()
+    for name in ('Nintendo-DS.png', 'Nintendo-DS.png.layout'):
+        assert entries['backgrounds/'+name.replace('Nintendo-DS','Nintendo DS')] == (ROOT / 'third_party/backgrounds/pngkey-ds' / name).read_bytes()
+    for file in (ROOT / 'third_party/backgrounds/lnkd').glob('*.png*'):
+        assert entries['backgrounds/lnkd/'+file.name] == file.read_bytes()
     assert b'LSFG Deko3D: preparing native shader cache' in hosts[0]
     assert not any(Path(path).name.lower() == 'lossless.dll' for path in entries)
     assert not any('bios' in Path(path).name.lower() or Path(path).name.lower().startswith('nds_firmware') for path in entries)
