@@ -166,6 +166,20 @@ def handoff(core: ELFFile, compiler: Path, libnx: Path, shaders: Path | None) ->
 
 def package_shaders(nro: Path, output: Path) -> None:
     data = nro.read_bytes()
+    expected_version = re.search(r'^APP_VERSION\s*:=\s*(\S+)',
+        (ROOT / 'Makefile').read_text(), re.M).group(1)
+
+    def nacp_version(blob: bytes) -> str:
+        assert len(blob) >= 0x3070
+        return blob[0x3060:0x3070].split(b'\0', 1)[0].decode('ascii')
+
+    def nro_version(blob: bytes) -> str:
+        asset, = struct.unpack_from('<I', blob, 0x18)
+        assert blob[asset:asset+4] == b'ASET'
+        offset, length = struct.unpack_from('<2Q', blob, asset+24)
+        return nacp_version(blob[asset+offset:asset+offset+length])
+
+    assert nro_version(data) == expected_version, 'Launcher NACP version is stale'
     assert data[0x10:0x14] == b'NRO0', 'Not an NRO'
     aset, = struct.unpack_from('<I', data, 0x18)
     assert data[aset:aset+4] == b'ASET', 'NRO has no assets'
@@ -214,6 +228,8 @@ def package_shaders(nro: Path, output: Path) -> None:
                 native_count += 1
     hosts = [blob for path, blob in entries.items() if path.endswith('/DrasticDS_nx.nro')]
     assert len(hosts) == 1 and b'Deko3D initialized:' in hosts[0]
+    assert nro_version(hosts[0]) == expected_version, 'Embedded host NACP version is stale'
+    assert nacp_version(entries['fwd/default.nacp']) == expected_version, 'Forwarder NACP version is stale'
     assert 'backgrounds/DS Logo.png' not in entries
     assert not any(path.startswith('backgrounds/licenses/ds-logo/') for path in entries)
     assert entries['backgrounds/licenses/pocketarch/LICENSE'] == (ROOT / 'third_party/backgrounds/pocketarch/LICENSE').read_bytes()

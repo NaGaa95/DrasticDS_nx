@@ -2271,9 +2271,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   const VkApplicationInfo application = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "DrasticDS_nx",
-    .applicationVersion = VK_MAKE_VERSION(1, 1, 0),
+    .applicationVersion = VK_MAKE_VERSION(1, 2, 0),
     .pEngineName = "Drastic Switch wrapper",
-    .engineVersion = VK_MAKE_VERSION(1, 1, 0),
+    .engineVersion = VK_MAKE_VERSION(1, 2, 0),
     .apiVersion = VK_API_VERSION_1_1,
   };
   const VkInstanceCreateInfo instance_info = {

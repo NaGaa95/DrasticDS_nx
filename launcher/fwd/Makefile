@@ -6,7 +6,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    ?= ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.1.2
+VERSION := 1.2.0
 AUTHOR  := naga
 OPTIMIZATION := -O3 -flto=auto
 
