@@ -16,10 +16,6 @@
 static constexpr size_t MAX_BODY = 24u * 1024 * 1024;
 static bool g_networkReady = false;
 struct Buf { std::string data; };
-static thread_local const std::atomic<bool> *g_requestCancel=nullptr;
-static int request_progress(void*,curl_off_t,curl_off_t,curl_off_t,curl_off_t){
-  return g_requestCancel&&g_requestCancel->load(std::memory_order_relaxed)?1:0;
-}
 static size_t write_cb(void *p, size_t sz, size_t n, void *u) {
   Buf *b = (Buf *)u;
   if (n != 0 && sz > std::numeric_limits<size_t>::max() / n) return 0;
@@ -29,10 +25,18 @@ static size_t write_cb(void *p, size_t sz, size_t n, void *u) {
   return add;
 }
 
+static int transfer_progress(void *userdata, curl_off_t, curl_off_t,
+                             curl_off_t, curl_off_t) {
+  const auto *cancel = static_cast<const std::atomic_bool *>(userdata);
+  return cancel && cancel->load(std::memory_order_acquire) ? 1 : 0;
+}
+
 // CURL success does not imply HTTP success.
 static bool http_get(const std::string &url, const std::string &bearer,
-                     std::string &out, long *code) {
+                     std::string &out, long *code,
+                     const std::atomic_bool *cancel) {
   if (code) *code = 0;
+  if (cancel && cancel->load(std::memory_order_acquire)) return false;
   if (!g_networkReady) return false;
   CURL *c = curl_easy_init();
   if (!c) return false;
@@ -56,10 +60,12 @@ static bool http_get(const std::string &url, const std::string &bearer,
   curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
 #endif
   curl_easy_setopt(c, CURLOPT_TIMEOUT, 25L);
-  curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)MAX_BODY);
-  curl_easy_setopt(c, CURLOPT_USERAGENT, "DrasticDS-nx/0.1");
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 8L);
   curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
-  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, request_progress);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, transfer_progress);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, cancel);
+  curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)MAX_BODY);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, "DrasticDS-nx/1.1");
   CURLcode rc = curl_easy_perform(c);
   long hc = 0;
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &hc);
@@ -70,10 +76,13 @@ static bool http_get(const std::string &url, const std::string &bearer,
   return rc == CURLE_OK;
 }
 
-static bool http_download(const std::string &url, const std::string &path) {
+static bool http_download(const std::string &url, const std::string &path,
+                          const std::atomic_bool *cancel) {
   std::string data;
   long code = 0;
-  if (!http_get(url, "", data, &code) || code < 200 || code >= 300 || data.size() < 64)
+  if (!http_get(url, "", data, &code, cancel) ||
+      (cancel && cancel->load(std::memory_order_acquire)) ||
+      code < 200 || code >= 300 || data.size() < 64)
     return false;
   const unsigned char *d = (const unsigned char *)data.data();
   bool png = d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G';
@@ -193,7 +202,8 @@ static bool parse_json_string(const std::string &json, size_t position, std::str
   return false;
 }
 
-static std::vector<std::string> json_data_objects(const std::string &json) {
+static std::vector<std::string> json_data_objects(const std::string &json, bool *complete = nullptr) {
+  if (complete) *complete = false;
   std::vector<std::string> objects;
   size_t data = json.find("\"data\"");
   if (data == std::string::npos) return objects;
@@ -218,7 +228,10 @@ static std::vector<std::string> json_data_objects(const std::string &json) {
         objects.emplace_back(json.substr(start, index - start + 1));
         start = std::string::npos;
       }
-    } else if (value == ']' && depth == 0) break;
+    } else if (value == ']' && depth == 0) {
+      if (complete) *complete = true;
+      break;
+    }
   }
   return objects;
 }
@@ -267,18 +280,21 @@ void griddb_global_exit(void) {
 
 static int status_err(long code) {
   if (code == 401 || code == 403) return GRIDDB_NO_KEY;
-  if (code < 200 || code >= 300) return GRIDDB_NOT_FOUND;
+  if (code == 404) return GRIDDB_NOT_FOUND;
+  if (code < 200 || code >= 300) return GRIDDB_ERROR;
   return GRIDDB_OK;
 }
 
 int griddb_search_games(const std::string &key, const std::string &title,
-                        std::vector<GridDbGameResult> &results) {
+                        std::vector<GridDbGameResult> &results,
+                        const std::atomic_bool *cancel) {
   results.clear();
   if (key.empty()) return GRIDDB_NO_KEY;
   std::string response;
   long code = 0;
   std::string search = "https://www.steamgriddb.com/api/v2/search/autocomplete/" + url_encode(title);
-  if (!http_get(search, key, response, &code)) return GRIDDB_NO_NET;
+  if (!http_get(search, key, response, &code, cancel))
+    return cancel && cancel->load(std::memory_order_acquire) ? GRIDDB_CANCELLED : GRIDDB_NO_NET;
   int error = status_err(code);
   if (error) return error;
   std::unordered_set<long> seen;
@@ -294,22 +310,30 @@ int griddb_search_games(const std::string &key, const std::string &title,
   return results.empty() ? GRIDDB_NOT_FOUND : GRIDDB_OK;
 }
 
-int griddb_fetch_artworks(const std::string &key, long gameId,
-                          std::vector<GridDbArtwork> &artworks) {
+static int fetch_artworks(const std::string &key, long gameId, const char *kind,
+                          const char *dimensions, std::vector<GridDbArtwork> &artworks,
+                          const std::atomic_bool *cancel) {
   artworks.clear();
   if (key.empty()) return GRIDDB_NO_KEY;
   if (gameId <= 0) return GRIDDB_NOT_FOUND;
-  char endpoint[320];
+  char endpoint[384];
   snprintf(endpoint, sizeof(endpoint),
-           "https://www.steamgriddb.com/api/v2/grids/game/%ld?dimensions=600x900&types=static&mimes=image/png,image/jpeg",
-           gameId);
+           "https://www.steamgriddb.com/api/v2/%s/game/%ld?types=static&mimes=image/png,image/jpeg&nsfw=false&humor=false&order=score%s%s",
+           kind, gameId, *dimensions ? "&dimensions=" : "", dimensions);
   std::string response;
   long code = 0;
-  if (!http_get(endpoint, key, response, &code)) return GRIDDB_NO_NET;
+  if (!http_get(endpoint, key, response, &code, cancel))
+    return cancel && cancel->load(std::memory_order_acquire) ? GRIDDB_CANCELLED : GRIDDB_NO_NET;
   int error = status_err(code);
   if (error) return error;
+  const size_t success = json_field_value(response, "success"), data = json_field_value(response, "data");
+  bool complete = false;
+  const auto objects = json_data_objects(response, &complete);
+  if (success == std::string::npos || response.compare(success, 4, "true") ||
+      data >= response.size() || response[data] != '[' || !complete)
+    return GRIDDB_ERROR;
   std::unordered_set<std::string> seen;
-  for (const auto &object : json_data_objects(response)) {
+  for (const auto &object : objects) {
     GridDbArtwork artwork;
     long width = 0, height = 0;
     json_object_number(object, "width", width);
@@ -326,33 +350,49 @@ int griddb_fetch_artworks(const std::string &key, long gameId,
   return artworks.empty() ? GRIDDB_NOT_FOUND : GRIDDB_OK;
 }
 
-int griddb_download_image(const std::string &url, const std::string &outPath) {
-  return !url.empty() && http_download(url, outPath) ? GRIDDB_OK : GRIDDB_ERROR;
+int griddb_fetch_artworks(const std::string &key, long gameId,
+                          std::vector<GridDbArtwork> &artworks,
+                          const std::atomic_bool *cancel) {
+  return fetch_artworks(key, gameId, "grids", "600x900", artworks, cancel);
 }
 
-int griddb_fetch_cover(const std::string &key, const std::string &title,
-                       const std::string &outPath,const std::atomic<bool> *cancel) {
-  struct CancelScope{const std::atomic<bool>* previous;explicit CancelScope(const std::atomic<bool>* next):previous(g_requestCancel){g_requestCancel=next;}~CancelScope(){g_requestCancel=previous;}} scope(cancel);
-  if(cancel&&cancel->load(std::memory_order_relaxed))return GRIDDB_ERROR;
-  std::vector<GridDbGameResult> games;
-  int result = griddb_search_games(key, title, games);
-  if (result != GRIDDB_OK||(cancel&&cancel->load(std::memory_order_relaxed))) return result;
+int griddb_download_image(const std::string &url, const std::string &outPath,
+                          const std::atomic_bool *cancel) {
+  if (cancel && cancel->load(std::memory_order_acquire)) return GRIDDB_CANCELLED;
+  const bool downloaded=!url.empty() && http_download(url, outPath, cancel);
+  if(downloaded) return GRIDDB_OK;
+  if(cancel && cancel->load(std::memory_order_acquire)) return GRIDDB_CANCELLED;
+  return GRIDDB_ERROR;
+}
+
+int griddb_fetch_backgrounds(const std::string &key, long gameId,
+                             std::vector<GridDbArtwork> &artworks, const std::atomic_bool *cancel) {
+  int result = fetch_artworks(key, gameId, "heroes", "", artworks, cancel);
+  if (result == GRIDDB_NOT_FOUND)
+    result = fetch_artworks(key, gameId, "grids", "920x430,460x215", artworks, cancel);
+  return result;
+}
+
+int griddb_fetch_background(const std::string &key, long gameId,
+                            const std::string &outPath, const std::atomic_bool *cancel) {
   std::vector<GridDbArtwork> artworks;
-  result = griddb_fetch_artworks(key, games.front().id, artworks);
-  if (result != GRIDDB_OK||(cancel&&cancel->load(std::memory_order_relaxed))) return result;
-  return griddb_download_image(artworks.front().url, outPath);
+  int result = griddb_fetch_backgrounds(key, gameId, artworks, cancel);
+  if (result != GRIDDB_OK) return result;
+  return griddb_download_image(artworks.front().url, outPath, cancel);
 }
 
-int griddb_fetch_icons(const std::string &key, const std::string &title, const std::string &outDir, int maxCount) {
+int griddb_fetch_icons(const std::string &key, const std::string &title,
+                       const std::string &outDir, int maxCount,
+                       const std::atomic_bool *cancel) {
   if (key.empty()) return 0;
   std::vector<GridDbGameResult> games;
-  if (griddb_search_games(key, title, games) != GRIDDB_OK) return 0;
+  if (griddb_search_games(key, title, games, cancel) != GRIDDB_OK) return 0;
   long gameId = games.front().id;
   const int cap = maxCount * 3;
   std::vector<std::string> urls;
   auto collect = [&](const char *api) {
     std::string r; long c = 0;
-    if (!http_get(api, key, r, &c) || status_err(c)) return;
+    if (!http_get(api, key, r, &c, cancel) || status_err(c)) return;
     size_t pos = 0; const std::string tag = "\"url\":\"";
     while ((int)urls.size() < cap) {
       size_t at = r.find(tag, pos);
@@ -378,9 +418,9 @@ int griddb_fetch_icons(const std::string &key, const std::string &title, const s
 
   int saved = 0;
   for (const auto &u : urls) {
-    if (saved >= maxCount) break;
+    if (saved >= maxCount || (cancel && cancel->load(std::memory_order_acquire))) break;
     char out[256]; snprintf(out, sizeof(out), "%s/gicon_%d.png", outDir.c_str(), saved);
-    if (http_download(u, out)) saved++;
+    if (http_download(u, out, cancel)) saved++;
   }
   return saved;
 }

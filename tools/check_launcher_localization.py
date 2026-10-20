@@ -15,6 +15,20 @@ if "Changes this launcher or emulator option" in MAIN or 'std::string("Maps ")' 
 catalog_entries = CATALOG[CATALOG.index("constexpr Entry ENTRIES[]"):
                           CATALOG.index("std::string systemLanguage")]
 entries = set(re.findall(r'^\s*\{"((?:[^"\\]|\\.)*)"\s*,', catalog_entries, re.M))
+ui_keys = set(re.findall(r'\btr\("([^"\n]*)"\)', MAIN)) | {
+    "Recent", "All games", "Favorites", "Nothing played yet", "No favorites yet",
+    "Games you launch appear here, most recent first.",
+    "Mark games as favorites from their game menu.",
+    "Add game folders in Settings to populate your library.",
+    "Choose background artwork", "Loading background artwork", "Skip background",
+    "Cover and background downloaded", "Background search failed",
+    "Background download failed", "Cover downloaded. No background artwork was found.",
+}
+missing_ui = sorted(ui_keys - entries)
+if missing_ui:
+    raise SystemExit(f"launcher UI localization coverage failed: {missing_ui}")
+if re.search(r'LauncherTheme|C_launcherTheme|XMB \(PS3\)|OLED black|drawBubblesBackground', MAIN):
+    raise SystemExit("the launcher must only expose the Classic interface")
 chinese_rows = re.findall(
     r'^\s*\{"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\},',
     CHINESE,

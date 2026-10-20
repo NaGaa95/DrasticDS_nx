@@ -1,0 +1,26 @@
+settings.svg is adapted from Autorun's horizon-wine/assets/sliders.svg.
+Source: https://github.com/autorunhq/autorun/blob/cbb0e4e6e7fa7f47f328d92441f51bfb507f266f/horizon-wine/assets/sliders.svg
+The fill color was changed from currentColor to white.
+
+Autorun is distributed under the GNU Lesser General Public License, version
+2.1 or later. See COPYING.LIB for the license text.
+
+Upstream license notice:
+
+Copyright (c) 1993-2026 the Wine project authors (see the file AUTHORS
+for a complete list)
+
+Wine is free software; you can redistribute it and/or modify it under
+the terms of the GNU Lesser General Public License as published by the
+Free Software Foundation; either version 2.1 of the License, or (at
+your option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Lesser General Public License for more details.
+
+A copy of the GNU Lesser General Public License is included in the
+Wine distribution in the file COPYING.LIB. If you did not receive this
+copy, write to the Free Software Foundation, Inc., 51 Franklin St,
+Fifth Floor, Boston, MA 02110-1301, USA.

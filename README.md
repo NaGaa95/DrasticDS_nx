@@ -108,11 +108,28 @@ services of a game override. Launch it by holding **R** while opening an
 installed title, or use a forwarder.
 
 The launcher supports multiple library folders across SD, USB mass storage
-(FAT32, exFAT, NTFS), and SMB shares, cover downloads, themes, a file
-manager, and HOME-menu shortcut creation.
+(FAT32, exFAT, NTFS), and SMB shares, cover and background downloads, a file
+manager, and HOME-menu shortcut creation. The Classic interface uses the same
+navigation and artwork design as the NetherSX2 and Dolphin NX launchers.
+
+The library opens on **Recent**, with a scrolling row of games ordered by last
+launch. **All games** and **Favorites** use the configured cover grid. Press
+**L / R** to change tabs and **ZL / ZR** to page through games. **Up** from the
+top row focuses the tab bar and its settings icon. **A** launches the selected
+game; **Y** opens its game menu, where favorites can be toggled. Tabs, covers,
+the settings icon, and footer hints also support touch.
+
+Classic is the only theme; existing theme selections migrate automatically.
+**Cover settings** lets you choose a cover and an optional wide background
+from SteamGridDB. The Classic background follows the selected game and fades
+between artwork when animations are enabled. Covers remain available as a
+fallback, and embedded DS icons keep their original proportions. Configure
+the API key and download missing artwork under **Settings > Library & storage**.
 Use **Settings > Launcher > Launcher rotation** to select 0, 90, 180, or 270
 degrees. The 90 and 270 degree modes reflow the complete SDL launcher for
-vertical/tate use, while 0 and 180 retain its landscape layout. Touch follows
+vertical/tate use, including the recent-game carousel, artwork picker, and
+settings. The grid retains the configured games per page while choosing a
+portrait arrangement; 0 and 180 retain the landscape layout. Touch follows
 the displayed UI; D-Pad and stick menu directions remain physically mapped as
 normal.
 
@@ -193,6 +210,9 @@ JOBS=16 DRASTIC_APK_DIR=/path/to/extracted-apk \
 
 ### Credits
 
+* Settings icon adapted from [Autorun](https://github.com/autorunhq/autorun),
+  under LGPL 2.1 or later; source attribution and license are in
+  `launcher/romfs/icons/` and bundled with the launcher.
 * Drastic developers.
 * fgsfds for the Switch so-loader groundwork reused here.
 * TheOfficialFloW for the original Android so-loader lineage.
