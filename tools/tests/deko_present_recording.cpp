@@ -23,6 +23,7 @@ namespace {
 bool pref_low{}, pref_fg{}, initializing{};
 unsigned acquired_serial{}, captured_serial{}, presented{}, allocated_blocks{}, scanline_draws{};
 unsigned next_kind{}, next_id=1;
+unsigned source_scale=1, saltynx_frames{}, saltynx_width{}, saltynx_height{};
 int expected_rotation{};
 alignas(4096) uint8_t core_pool[DRASTIC_NATIVE_POOL_BYTES];
 std::vector<DkCmdBuf> commands;
@@ -34,6 +35,12 @@ template<class T,class U> void put(U *obj,T value) { static_assert(sizeof(T)<=si
 }
 
 extern "C" {
+void saltynx_set_resolution(uint32_t width,uint32_t height) { saltynx_width=width; saltynx_height=height; }
+void saltynx_frame(uint8_t api) {
+  check(api==1,"SaltyNX graphics API");
+  check(saltynx_width==256*source_scale&&saltynx_height==192*source_scale,"SaltyNX source resolution");
+  ++saltynx_frames;
+}
 int panel_width=1280,panel_height=720,screen_width=1280,screen_height=720;
 bool prefs_get_bool(const char *key,bool fallback) {
   if(!std::strcmp(key,"Wrapper/LowLatency")) return pref_low;
@@ -51,7 +58,7 @@ bool drastic_native_frame_lock(DrasticNativeFrame *frame) {
   captured_serial=acquired_serial;
   *frame={}; frame->allocation=core_pool; frame->bank=acquired_serial%2;
   frame->dirty=3; frame->bytes_per_pixel=4;
-  for(unsigned i=0;i<2;++i) { frame->width[i]=256; frame->height[i]=192; frame->pixels[i]=core_pool+frame->bank*DRASTIC_NATIVE_BANK_BYTES+i*DRASTIC_NATIVE_SCREEN_BYTES; }
+  for(unsigned i=0;i<2;++i) { frame->width[i]=256*source_scale; frame->height[i]=192*source_scale; frame->pixels[i]=core_pool+frame->bank*DRASTIC_NATIVE_BANK_BYTES+i*DRASTIC_NATIVE_SCREEN_BYTES; }
   return true;
 }
 void drastic_native_frame_unlock(void *lease,DrasticNativeFrameWait,unsigned uploaded) {
@@ -124,7 +131,7 @@ void dkCmdBufDraw(DkCmdBuf c,DkPrimitive,uint32_t count,uint32_t,uint32_t,uint32
   if(c->blend) { ++c->ui; return; }
   DrawParameters p; std::memcpy(&p,c->parameters,sizeof(p));
   if(p.effect==3&&p.mode==2) {
-    check(p.texture_size[0]==256&&p.texture_size[1]==192,"scanline source dimensions");
+    check(p.texture_size[0]==256*source_scale&&p.texture_size[1]==192*source_scale,"scanline source dimensions");
     check(p.target_size[0]==(expected_rotation&1?450:600)&&
           p.target_size[1]==(expected_rotation&1?600:450),"scanline target rotation"); ++scanline_draws;
   }
@@ -173,7 +180,7 @@ int main() {
   try {
     const std::vector<uint32_t> overlay_pixels(1280*720);
     for(unsigned width:{1280u,1920u}) for(bool low:{false,true}) for(bool fg:{false,true}) {
-      pref_low=low; pref_fg=fg; panel_width=width; panel_height=width*9/16;
+      pref_low=low; pref_fg=fg; source_scale=low?2:1; panel_width=width; panel_height=width*9/16;
       DrasticRuntimeConfig config{}; config.screen_count=2; config.stylus_visible=true;
       config.screens[0]={20,20,600,450,0,0}; config.screens[1]={640,20,600,450,1,1};
       initializing=true; check(drastic_deko_renderer_init(&config),drastic_deko_renderer_last_error()); initializing=false;
@@ -181,10 +188,12 @@ int main() {
       for(int rotation=0;rotation<4;++rotation) {
         config.rotation=expected_rotation=rotation; config.video_filter=DRASTIC_FILTER_SCANLINE;
         DrasticOverlayFrame overlay{overlay_pixels.data(),rotation&1?720:1280,rotation&1?1280:720,unsigned(rotation),true};
+        const auto reports=saltynx_frames;
         for(unsigned i=0;i<8;++i) { drastic_deko_renderer_present(&config,nullptr,nullptr,nullptr,&overlay,true); check(allocated_blocks==blocks,"GPU allocation in presentation"); }
         // Cached menu draws must bypass generation, then reprime on resume.
         config.video_filter=DRASTIC_FILTER_NEAREST;
         next_kind=0; drastic_deko_renderer_present(&config,nullptr,nullptr,nullptr,&overlay,false);
+        check(saltynx_frames==reports+8,"SaltyNX counted a generated or cached frame");
         drastic_deko_renderer_suspend(); drastic_deko_renderer_resume();
       }
       drastic_deko_renderer_shutdown(); check(allocated_blocks==0&&commands.empty(),"native resource leak");

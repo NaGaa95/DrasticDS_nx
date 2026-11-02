@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "saltynx.h"
 #include "drastic_custom_shader.h"
 #include "drastic_dfx.h"
 #include "drastic_dfx_gl_generated.h"
@@ -924,7 +925,11 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   draw_stylus_cursor(config);
   if (overlay && overlay->visible && upload_overlay(overlay))
     draw_overlay(config->rotation);
-  eglSwapBuffers(g_display, g_surface);
+  if (eglSwapBuffers(g_display, g_surface) != EGL_TRUE) return;
+  if (consume_core_frame) {
+    saltynx_set_resolution(g_texture_width, g_texture_height);
+    saltynx_frame(2);
+  }
   g_frames++;
 }
 

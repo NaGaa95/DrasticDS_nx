@@ -1,6 +1,7 @@
 /* Native Horizon display backend. No Android renderFrame, GL, EGL, Vulkan,
  * runtime shader compiler, or CPU pixel conversion in the core frame path. */
 #include "drastic_deko_renderer.h"
+#include "saltynx.h"
 #include "drastic_native_frame.h"
 #include "drastic_dksh.h"
 #include "drastic_dfx.h"
@@ -684,6 +685,11 @@ extern "C" void drastic_deko_renderer_present(const DrasticRuntimeConfig *config
     submit(restore);
     dkQueuePresentImage(g_queue, g_swapchain, real_index);
     require_healthy_renderer();
+  }
+  if (consume_core_frame) {
+    const Image *source = g_screen[0] ? g_screen[0] : g_screen[1];
+    if (source) saltynx_set_resolution(source->width, source->height);
+    saltynx_frame(1);
   }
   g_frames++;
 }

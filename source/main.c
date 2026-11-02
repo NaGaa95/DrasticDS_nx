@@ -19,6 +19,7 @@
 #include "drastic_config.h"
 #include "drastic_jit.h"
 #include "drastic_renderer.h"
+#include "saltynx.h"
 #include "drastic_native_frame.h"
 #include "drastic_rotation.h"
 #include "error.h"
@@ -855,6 +856,7 @@ static void applet_lifecycle_hook(AppletHookType hook, void *parameter) {
 
 int main(void) {
   cpu_boost(1);
+  saltynx_start();
   bool cpu_boost_active = true;
   setup_directories();
   prefs_init(PREFS_PATH);
@@ -1177,6 +1179,7 @@ int main(void) {
   pthr_finalize();
   libc_memory_shutdown();
   so_unload(&emu_mod);
+  saltynx_stop();
   switchStorageShutdown();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);

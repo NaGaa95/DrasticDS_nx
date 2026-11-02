@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "saltynx.h"
 #include "dfx_fxaa_frag_bin.h"
 #include "dfx_fxaa_hq_frag_bin.h"
 #include "dfx_fxaa_hq_vert_bin.h"
@@ -2538,6 +2539,10 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     if (present_result != VK_SUCCESS &&
         present_result != VK_SUBOPTIMAL_KHR)
       return;
+  }
+  if (consume_core_frame) {
+    saltynx_set_resolution(g_ds_width, g_ds_height);
+    saltynx_frame(3);
   }
   g_frames++;
 }
