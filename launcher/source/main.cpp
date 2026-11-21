@@ -572,6 +572,7 @@ enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU,
 static const Opt S_graphics[] = {
   O_CHOICE("Renderer",          "Wrapper/Renderer", C_backend, "deko3d"),
   O_CHOICE("Low latency", "Wrapper/LowLatency", C_bool, "true"),
+  O_SUB   ("3D and display options...", SCR_ENHANCE),
   O_CHOICE("Screen layout",     "Wrapper/Layout", C_layout, "horizontal"),
   O_ACTION("Custom layout editor...", "Wrapper/CustomLayoutEditor"),
   O_CHOICE("Lock native aspect ratio", "Wrapper/CustomAspectLock", C_bool, "true"),
@@ -584,7 +585,6 @@ static const Opt S_graphics[] = {
   O_BACKGROUND("Background / bezel...", "Wrapper/Background", ""),
   O_CHOICE("Background fit", "Wrapper/BackgroundFit", C_backgroundFit, "contain"),
   O_CHOICE("Show FPS",          "Drastic/ShowFPS", C_bool, "false"),
-  O_SUB   ("3D and display options...", SCR_ENHANCE),
 };
 static const Opt S_enhance[] = {
   O_CHOICE("High-resolution 3D", "Drastic/Hires3D", C_bool, "false"),
@@ -1383,8 +1383,20 @@ static void drawUpdateNotification();
 static void toast(const char *msg, Uint32 durationMs=1800);
 static void modalMessage(const char *title, const std::vector<std::string> &lines);
 static bool confirmBox(const char *title, const std::vector<std::string> &lines);
-static int dropdown(const char *title, const char *const *labels, int n, int cur,
-                    const SDL_Color *swatches=nullptr,
+// The caller owns the page and row for the duration of the dropdown.
+struct DropdownAnchor {
+  SDL_Rect row{};
+  std::function<void()> drawPage;
+};
+
+enum class RowSwitch { None, Off, On, DisabledOff, DisabledOn };
+static RowSwitch rowSwitch(bool on,bool enabled=true) {
+  if(!enabled) return on?RowSwitch::DisabledOn:RowSwitch::DisabledOff;
+  return on?RowSwitch::On:RowSwitch::Off;
+}
+
+static int dropdown(const DropdownAnchor &anchor,const char *const *labels,int count,int current,
+                    bool localizeChoices=false,const SDL_Color *swatches=nullptr,
                     const std::function<void(const SDL_Rect&,int)> &preview={});
 static void beginScreenFx();
 static void drawFadeIn();
@@ -1401,7 +1413,7 @@ static void drawSettingsRowText(const char *label,const char *value,
                                 int slotY,int colW,int labelX,int valX,
                                 bool current,SDL_Color labelColor,
                                 SDL_Color valueColor,bool scrollValue=false,
-                                int rowHeight=0);
+                                int rowHeight=0,RowSwitch toggle=RowSwitch::None);
 static void drawFooterText(const char *text,int centerY=-1);
 static void drawScrollTextR(TTF_Font *font,int xRight,int y,int maxWidth,const char *text,SDL_Color color);
 static void drawScrollTextL(TTF_Font *font,int x,int y,int maxWidth,const char *text,SDL_Color color);
@@ -1777,7 +1789,7 @@ static bool pressFooterButton(int x,int y){
 // than the state-dependent set below, so the cover grid keeps the same geometry
 // whether or not the current view happens to offer every action.
 static std::array<FootItem,3> libraryFooter(){
-  return {{{"A","Launch"},{"Y","Game Menu"},{"B","Quit"}}};
+  return {{{"A","Launch"},{"Y","Game menu"},{"B","Quit"}}};
 }
 // What is actually pressable right now.  Launch, Sort and the per-game menu all
 // no-op on an empty view, and paging is meaningless on a single page; the empty
@@ -3730,6 +3742,8 @@ static SmbFormLayout smbFormLayout(int fieldCount) {
   return layout;
 }
 
+static void drawSwitch(int rightX,int centerY,int height,bool on,bool enabled);
+
 static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
   SwitchStorage::SmbShare edited=share;
   constexpr int fieldCount=7,saveRow=7,totalRows=8;
@@ -3857,7 +3871,7 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
       edited.user.empty()?"Guest":edited.user,
       password,
       edited.domain.empty()?"Optional":edited.domain,
-      edited.autoMount?"On":"Off"
+      ""
     };
     for(int index=0;index<fieldCount;index++){
       int y=y0+index*rowHeight; bool current=sel==index;
@@ -3865,10 +3879,14 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
       if(g_launcherPortrait)
         drawSettingsRowText(labels[index],values[index].c_str(),y,formWidth-16,
                             margin+30,margin+formWidth-24,current,
-                            current?COL_VAL:COL_DIM,current?COL_VAL:COL_TXT,true);
+                            current?COL_VAL:COL_DIM,current?COL_VAL:COL_TXT,true,rowHeight,
+                            index==fieldCount-1?rowSwitch(edited.autoMount):RowSwitch::None);
       else {
         drawText(g_font_sm,margin+30,y+(rowHeight-fontHeight(g_font_sm))/2,labels[index],current?COL_VAL:COL_DIM);
-        drawScrollTextR(g_font,margin+formWidth-24,y+(rowHeight-fontHeight(g_font))/2,formWidth/2-30,values[index].c_str(),current?COL_VAL:COL_TXT);
+        if(index==fieldCount-1)
+          drawSwitch(margin+formWidth-24,y+rowHeight/2,22,edited.autoMount,true);
+        else
+          drawScrollTextR(g_font,margin+formWidth-24,y+(rowHeight-fontHeight(g_font))/2,formWidth/2-30,values[index].c_str(),current?COL_VAL:COL_TXT);
       }
     }
     const int buttonY=form.buttonY,buttonHeight=form.buttonHeight;
@@ -3921,6 +3939,38 @@ static void networkSharesScreen() {
     bool rebuild=false;
     while(!rebuild){
       if(!beginUiFrame()) return;
+      const auto drawPage = [&] {
+        clearUiBackground();
+        std::string summary=std::to_string(shares.size())+(shares.size()==1?" saved share":" saved shares");
+        drawHeader(LauncherLocalization::Translate("SMB network shares").data(),summary.c_str());
+        glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
+        for(int row=0;row<vis&&top+row<n;row++){
+          int index=top+row,y=listY+row*rowHeight; bool current=index==sel;
+          if(current) drawRowHighlight(colX,y,colW,rowHeight-4);
+          if(index==0)
+            drawText(g_font,labelX,y+(rowHeight-fontHeight(g_font))/2,
+                     LauncherLocalization::Translate("Add SMB share").data(),current?COL_VAL:COL_HI);
+          else { const auto &share=shares[index-1]; bool mounted=SwitchStorage::IsSmbMounted(share.id);
+            int nameY=y+(g_launcherPortrait?8:0);
+            std::string status=mounted?"Connected":(share.autoMount?"Disconnected - auto":"Disconnected");
+            const std::string shownStatus(LauncherLocalization::Translate(status));
+            const int statusWidth=textW(g_font_sm,shownStatus.c_str());
+            const int nameWidth=std::max(60,valX-labelX-statusWidth-24);
+            if(current) drawScrollTextL(g_font,labelX,nameY,nameWidth,share.name.c_str(),COL_VAL);
+            else drawText(g_font,labelX,nameY,fittedText(g_font,share.name,nameWidth).c_str(),COL_TXT);
+            drawTextR(g_font_sm,valX,nameY+4,shownStatus.c_str(),mounted?(SDL_Color){120,220,120,255}:COL_DIM);
+            std::string address="smb://"+share.server+"/"+share.share+(share.path.empty()?std::string{}:"/"+share.path);
+            drawText(g_font_sm,labelX,y+(g_launcherPortrait?48:31),
+                     fittedText(g_font_sm,address,valX-labelX).c_str(),COL_DIM); }
+        }
+        if(n>vis){
+          const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+          fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
+          const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+          fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
+        }
+        drawFooterText("A  Select       B  Back");
+      };
       SDL_Event event; navRepeat();
       while(pollUiEvent(event)){
         pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
@@ -3947,7 +3997,7 @@ static void networkSharesScreen() {
           } else {
             auto &share=shares[sel-1]; bool mounted=SwitchStorage::IsSmbMounted(share.id);
             const char *actions[]={mounted?"Disconnect":"Connect","Edit","Toggle connect at startup","Remove"};
-            int action=dropdown(share.name.c_str(),actions,4,0);
+            int action=dropdown({{colX,listY+(sel-top)*rowHeight,colW,rowHeight},drawPage},actions,4,-1,true);
             if(action==0){
               if(mounted) SwitchStorage::UnmountSmb(share.id);
               else { std::string error; if(!SwitchStorage::MountSmb(share,&error)) modalMessage("SMB connection failed",{error}); }
@@ -3972,36 +4022,7 @@ static void networkSharesScreen() {
         if(sel>=top+vis) top=sel-vis+1;
       }
       if(rebuild) break;
-      clearUiBackground();
-      std::string summary=std::to_string(shares.size())+(shares.size()==1?" saved share":" saved shares");
-      drawHeader(LauncherLocalization::Translate("SMB network shares").data(),summary.c_str());
-      glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
-      for(int row=0;row<vis&&top+row<n;row++){
-        int index=top+row,y=listY+row*rowHeight; bool current=index==sel;
-        if(current) drawRowHighlight(colX,y,colW,rowHeight-4);
-        if(index==0)
-          drawText(g_font,labelX,y+(rowHeight-fontHeight(g_font))/2,
-                   LauncherLocalization::Translate("Add SMB share").data(),current?COL_VAL:COL_HI);
-        else { const auto &share=shares[index-1]; bool mounted=SwitchStorage::IsSmbMounted(share.id);
-          int nameY=y+(g_launcherPortrait?8:0);
-          std::string status=mounted?"Connected":(share.autoMount?"Disconnected - auto":"Disconnected");
-          const std::string shownStatus(LauncherLocalization::Translate(status));
-          const int statusWidth=textW(g_font_sm,shownStatus.c_str());
-          const int nameWidth=std::max(60,valX-labelX-statusWidth-24);
-          if(current) drawScrollTextL(g_font,labelX,nameY,nameWidth,share.name.c_str(),COL_VAL);
-          else drawText(g_font,labelX,nameY,fittedText(g_font,share.name,nameWidth).c_str(),COL_TXT);
-          drawTextR(g_font_sm,valX,nameY+4,shownStatus.c_str(),mounted?(SDL_Color){120,220,120,255}:COL_DIM);
-          std::string address="smb://"+share.server+"/"+share.share+(share.path.empty()?std::string{}:"/"+share.path);
-          drawText(g_font_sm,labelX,y+(g_launcherPortrait?48:31),
-                   fittedText(g_font_sm,address,valX-labelX).c_str(),COL_DIM); }
-      }
-      if(n>vis){
-        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
-        fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
-        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
-        fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
-      }
-      drawFooterText("A  Select       B  Back");
+      drawPage();
       presentUi(); waitForNextUiFrame();
     }
   }
@@ -4174,7 +4195,7 @@ static bool toggleFavorite(const std::string &path) {
   saveFavoriteFolders(favorites); toast(pinned?"Folder pinned":"Folder unpinned",650); return true;
 }
 
-static bool browserActions(const BrowserItem &item,BrowserMode mode) {
+static bool browserActions(const BrowserItem &item,BrowserMode mode,const DropdownAnchor &anchor) {
   if(item.kind!=BrowserItemKind::Directory&&item.kind!=BrowserItemKind::File&&item.kind!=BrowserItemKind::Use) return false;
   std::vector<std::string> labels;
   if(mode==BrowserMode::Manage){ labels={"Copy","Move","Rename"}; }
@@ -4187,7 +4208,7 @@ static bool browserActions(const BrowserItem &item,BrowserMode mode) {
   }
   if(labels.empty()) return false;
   std::vector<const char*> choices; for(const auto &label:labels) choices.push_back(label.c_str());
-  int action=dropdown("File options",choices.data(),(int)choices.size(),0);
+  int action=dropdown(anchor,choices.data(),(int)choices.size(),-1,true);
   if(action<0) return false;
   if(mode==BrowserMode::Manage&&action==0){ g_fileClipboard={item.path,false}; toast("Copied to clipboard",600); return false; }
   if(mode==BrowserMode::Manage&&action==1){ g_fileClipboard={item.path,true}; toast("Move queued",600); return false; }
@@ -4244,6 +4265,49 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
     bool rebuild=false;
     while(!rebuild){
       if(!beginUiFrame()) return {};
+      const auto drawPage = [&] {
+        clearUiBackground();
+        const char *title=mode==BrowserMode::Manage?"File manager":mode==BrowserMode::SelectImage?"Select local cover":"Select game folder";
+        drawHeader(LauncherLocalization::Translate(title).data(),
+                   current.empty()?LauncherLocalization::Translate("Locations").data():current.c_str());
+        // The list shares the settings column so every list in the launcher lines
+        // up, and the panel hugs the rows actually shown.
+        glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
+        for(int row=0;row<vis&&top+row<n;row++){
+          int index=top+row,slotY=listY+row*rowHeight;
+          int y=slotY+(rowHeight-fontHeight(g_font))/2;
+          bool selected=index==sel; const auto &item=items[index];
+          if(selected) drawRowHighlight(colX,slotY,colW,rowHeight-4);
+          SDL_Color color=item.kind==BrowserItemKind::Use||item.kind==BrowserItemKind::Paste||item.kind==BrowserItemKind::Favorite?COL_HI:(item.directory?COL_TXT:(SDL_Color){120,220,120,255});
+          const int nameWidth=valX-labelX;
+          // A long selected filename scrolls; the rest stay ellipsized.
+          if(selected) drawScrollTextL(g_font,labelX,y,nameWidth,item.label.c_str(),COL_VAL);
+          else drawText(g_font,labelX,y,ellipsizedText(g_font,item.label,nameWidth).c_str(),color);
+        }
+        if(n>vis){
+          const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+          fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
+          const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+          fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
+        }
+        // Every hint here depends on the selected row or on the browser's state:
+        // "Actions" needs a real entry, "Paste" needs a loaded clipboard and a
+        // directory that can receive it, and "Eject USB" needs the selection to
+        // sit on removable storage.
+        const BrowserItem &selected=items[sel];
+        const std::string &ejectTarget=current.empty()?selected.path:current;
+        FootItem footer[5]={};int hintCount=0;
+        if(const char *confirm=browserConfirmHint(selected,mode))
+          footer[hintCount++]={"A",confirm,FA_NONE};
+        if(browserActionsAvailable(selected,mode))
+          footer[hintCount++]={"X",mode==BrowserMode::Manage?"Actions":"Pin",FA_NONE};
+        if(mode==BrowserMode::Manage&&!current.empty()&&!g_fileClipboard.path.empty())
+          footer[hintCount++]={"Y","Paste",FA_NONE};
+        if(mode==BrowserMode::Manage&&isUsbStoragePath(ejectTarget))
+          footer[hintCount++]={"+","Eject USB",FA_NONE};
+        footer[hintCount++]={"B","Back",FA_NONE};
+        drawFooterHints(footer,hintCount,SH-26);
+      };
       SDL_Event event; navRepeat();
       while(pollUiEvent(event)){
         pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
@@ -4262,7 +4326,7 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
         if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+n-1)%n;
         else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%n;
         else if(event.cbutton.button==BTN_CANCEL){ if(current.empty()) return {}; current=parentFolder(current); sel=top=0; rebuild=true; }
-        else if(event.cbutton.button==BTN_X){ if(browserActions(items[sel],mode)) rebuild=true; }
+        else if(event.cbutton.button==BTN_X){ if(browserActions(items[sel],mode,{{colX,listY+(sel-top)*rowHeight,colW,rowHeight},drawPage})) rebuild=true; }
         else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&mode==BrowserMode::Manage&&!current.empty()&&!g_fileClipboard.path.empty()){ executePaste(current); rebuild=true; }
         else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_START&&mode==BrowserMode::Manage){
           const std::string target=current.empty()?items[sel].path:current;
@@ -4293,47 +4357,7 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
         if(sel>=top+vis) top=sel-vis+1;
       }
       if(rebuild) break;
-      clearUiBackground();
-      const char *title=mode==BrowserMode::Manage?"File manager":mode==BrowserMode::SelectImage?"Select local cover":"Select game folder";
-      drawHeader(LauncherLocalization::Translate(title).data(),
-                 current.empty()?LauncherLocalization::Translate("Locations").data():current.c_str());
-      // The list shares the settings column so every list in the launcher lines
-      // up, and the panel hugs the rows actually shown.
-      glassPanel(colX-12,listY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
-      for(int row=0;row<vis&&top+row<n;row++){
-        int index=top+row,slotY=listY+row*rowHeight;
-        int y=slotY+(rowHeight-fontHeight(g_font))/2;
-        bool selected=index==sel; const auto &item=items[index];
-        if(selected) drawRowHighlight(colX,slotY,colW,rowHeight-4);
-        SDL_Color color=item.kind==BrowserItemKind::Use||item.kind==BrowserItemKind::Paste||item.kind==BrowserItemKind::Favorite?COL_HI:(item.directory?COL_TXT:(SDL_Color){120,220,120,255});
-        const int nameWidth=valX-labelX;
-        // A long selected filename scrolls; the rest stay ellipsized.
-        if(selected) drawScrollTextL(g_font,labelX,y,nameWidth,item.label.c_str(),COL_VAL);
-        else drawText(g_font,labelX,y,ellipsizedText(g_font,item.label,nameWidth).c_str(),color);
-      }
-      if(n>vis){
-        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
-        fillRect(trackX,listY,4,trackHeight,(SDL_Color){40,44,54,255});
-        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
-        fillRect(trackX,listY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
-      }
-      // Every hint here depends on the selected row or on the browser's state:
-      // "Actions" needs a real entry, "Paste" needs a loaded clipboard and a
-      // directory that can receive it, and "Eject USB" needs the selection to
-      // sit on removable storage.
-      const BrowserItem &selected=items[sel];
-      const std::string &ejectTarget=current.empty()?selected.path:current;
-      FootItem footer[5]={};int hintCount=0;
-      if(const char *confirm=browserConfirmHint(selected,mode))
-        footer[hintCount++]={"A",confirm,FA_NONE};
-      if(browserActionsAvailable(selected,mode))
-        footer[hintCount++]={"X",mode==BrowserMode::Manage?"Actions":"Pin",FA_NONE};
-      if(mode==BrowserMode::Manage&&!current.empty()&&!g_fileClipboard.path.empty())
-        footer[hintCount++]={"Y","Paste",FA_NONE};
-      if(mode==BrowserMode::Manage&&isUsbStoragePath(ejectTarget))
-        footer[hintCount++]={"+","Eject USB",FA_NONE};
-      footer[hintCount++]={"B","Back",FA_NONE};
-      drawFooterHints(footer,hintCount,SH-26);
+      drawPage();
       presentUi(); waitForNextUiFrame();
     }
   }
@@ -4540,7 +4564,7 @@ static void applyBackgroundLayout(const std::string &path) {
   iniSet("Wrapper/Rotation",rotation);iniSet("Wrapper/BackgroundFit","stretch");
 }
 
-static void chooseBackground(const Opt &option) {
+static void chooseBackground(const Opt &option,const DropdownAnchor &anchor) {
   std::vector<std::string> paths,labels;
   for(const auto &style:BACKGROUND_STYLES){paths.push_back(style.val);labels.push_back(tr(style.label));}
   std::vector<std::string> images;scanBackgrounds(BACKGROUNDS_DIR,0,images);
@@ -4553,7 +4577,7 @@ static void chooseBackground(const Opt &option) {
     choices.push_back(labels[i].c_str());if(i<paths.size()&&toEmu(paths[i])==toEmu(configured))current=(int)i;
   }
   BezelPreview preview;
-  const int selected=dropdown(tr("Background / bezel..."),choices.data(),(int)choices.size(),current,nullptr,
+  const int selected=dropdown(anchor,choices.data(),(int)choices.size(),current,false,nullptr,
     [&](const SDL_Rect &area,int index){preview.draw(area,index<(int)paths.size()?paths[index]:"@import");});
   if(selected<0)return;
   if(selected<(int)paths.size()){
@@ -4747,6 +4771,20 @@ static int choiceIdx(const Opt &o) {
   for (int i=0;i<o.nch;i++) if (!strcmp(o.ch[i].val, cur)) return i;
   return -1;
 }
+// Inspect the choices before translation so modes such as Off / Auto / On
+// and text summaries keep their full value.
+static RowSwitch optionSwitch(const Opt &option,bool enabled=true) {
+  if(option.type!=OT_CHOICE || option.nch!=2) return RowSwitch::None;
+  const std::string_view first = option.ch[0].label;
+  const std::string_view second = option.ch[1].label;
+  if(!((first=="Off" && second=="On") || (first=="On" && second=="Off")))
+    return RowSwitch::None;
+  const int index = choiceIdx(option);
+  if(index<0) return RowSwitch::None;
+  return rowSwitch(std::string_view(option.ch[index].label)=="On",enabled);
+}
+
+
 static bool optEnabled(const Opt &o) {
   if(o.key&&!strcmp(o.key,"Wrapper/LowLatency")){
     const char *renderer=iniGet("Wrapper/Renderer","deko3d");
@@ -5052,15 +5090,28 @@ static bool settingsRowNeedsStackedText(const char *label,const char *value,
   return textW(g_font,label)+gap+textW(g_font,value)>valX-labelX;
 }
 
+static void drawSwitch(int rightX,int centerY,int height,bool on,bool enabled) {
+  const int width = height * 9 / 5;
+  const int x = rightX - width;
+  const int y = centerY - height / 2;
+  const SDL_Color track = !enabled ? SDL_Color{44,52,62,255} :
+                          on ? COL_SEL : SDL_Color{58,68,82,255};
+  roundedRect(x,y,width,height,height/2,track);
+  const int inset = std::max(2,height/8);
+  const int knob = height - 2 * inset;
+  roundedRect(on?rightX-inset-knob:x+inset,y+inset,knob,knob,knob/2,
+              enabled?SDL_Color{245,250,255,255}:SDL_Color{140,150,160,255});
+}
+
 static void drawSettingsRowText(const char *label,const char *value,
                                 int slotY,int colW,int labelX,int valX,
                                 bool current,SDL_Color labelColor,
                                 SDL_Color valueColor,bool scrollValue,
-                                int rowHeight){
+                                int rowHeight,RowSwitch toggle){
   const int actualRowHeight=rowHeight>0?rowHeight:settingsRowH();
   if(!current)
     fillRect(labelX,slotY+actualRowHeight-1,valX-labelX,1,(SDL_Color){255,255,255,10});
-  if(settingsRowNeedsStackedText(label,value,labelX,valX)){
+  if(toggle==RowSwitch::None && settingsRowNeedsStackedText(label,value,labelX,valX)){
     const int maxWidth=std::max(40,valX-labelX);
     const int labelHeight=fontHeight(g_font);
     const int valueHeight=fontHeight(g_font_sm);
@@ -5078,7 +5129,8 @@ static void drawSettingsRowText(const char *label,const char *value,
   }
   // A literal ">" value means "opens a submenu" and renders as a chevron.
   const bool submenu=value&&!strcmp(value,">");
-  const int valueWidth=submenu?16:std::min(textW(g_font_sm,value),colW/2-32);
+  const int switchHeight=std::min(22,actualRowHeight-12);
+  const int valueWidth=submenu?16:toggle!=RowSwitch::None?switchHeight*9/5:std::min(textW(g_font_sm,value),colW/2-32);
   const int labelWidth=std::max(40,valX-labelX-valueWidth-24);
   const int y=slotY+(actualRowHeight-fontHeight(g_font))/2;
   if(current) drawScrollTextL(g_font,labelX,y,labelWidth,label,labelColor);
@@ -5088,6 +5140,10 @@ static void drawSettingsRowText(const char *label,const char *value,
     SDL_SetRenderDrawColor(g_ren,valueColor.r,valueColor.g,valueColor.b,valueColor.a);
     SDL_RenderDrawLine(g_ren,valX-10,cy-6,valX-4,cy);
     SDL_RenderDrawLine(g_ren,valX-4,cy,valX-10,cy+6);
+  }else if(toggle!=RowSwitch::None){
+    const bool on=toggle==RowSwitch::On || toggle==RowSwitch::DisabledOn;
+    const bool enabled=toggle==RowSwitch::On || toggle==RowSwitch::Off;
+    drawSwitch(valX,slotY+actualRowHeight/2,switchHeight,on,enabled);
   }else{
     const int valueY=slotY+(actualRowHeight-fontHeight(g_font_sm))/2;
     if(scrollValue) drawScrollTextR(g_font_sm,valX,valueY,colW/2-32,value,valueColor);
@@ -5214,6 +5270,12 @@ static const char *settingsScreenDescription(int screen) {
   }
 }
 
+static DropdownAnchor settingsDropdownAnchor(int rowY,int rowHeight,std::function<void()> drawPage) {
+  int colX,colW,labelX,valX;
+  listCol(&colX,&colW,&labelX,&valX);
+  return {{colX,rowY,colW,rowHeight},std::move(drawPage)};
+}
+
 static void renderSettings(int scr,int sel,int top,const char *ctx){
   clearUiBackground();
   const Screen &S=g_screens[scr];
@@ -5235,7 +5297,7 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     char v[256]; optValue(S.opts[i],v,sizeof(v));
     const std::string value=std::string(LauncherLocalization::Translate(v));
     drawSettingsRowText(LauncherLocalization::Translate(S.opts[i].label).data(),value.c_str(),slotY,colW,labelX,valX,
-                        cur,lc,vc,S.opts[i].type==OT_SHADER || S.opts[i].type==OT_BACKGROUND);
+                        cur,lc,vc,S.opts[i].type==OT_SHADER || S.opts[i].type==OT_BACKGROUND,rowH,optionSwitch(S.opts[i],en));
     if(S.opts[i].key && !strcmp(S.opts[i].key,"Drastic/FirmwareColor")){
       int colorIndex=choiceIdx(S.opts[i]);
       if(colorIndex>=0 && colorIndex<(int)(sizeof(C_firmwareColorRgb)/sizeof(*C_firmwareColorRgb))){
@@ -5275,98 +5337,133 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
   footer[hintCount++]={"B","Back",FA_NONE};
   drawFooterHints(footer,hintCount,SH-26);
   drawFadeIn();
-  presentUi();
 }
 
-static int dropdown(const char *title, const char *const *labels, int n, int cur,
-                    const SDL_Color *swatches,
-                    const std::function<void(const SDL_Rect&,int)> &preview) {
-  if(n<1) return cur;
-  int sel = (cur < 0 || cur >= n) ? 0 : cur, top = 0;
-  // One source of truth for the panel geometry: the draw code and the hit test
-  // used to recompute it with different formulas and could disagree.
-  const int rowH = settingsRowH()+8;
-  const int vis = std::min(n,std::max(1,(SH-240)/rowH));
-  const int pw = preview?std::min(1160,SW-48):std::min(900,SW-64), ph = 140+vis*rowH;
-  const int listWidth=preview?pw*3/5:pw;
-  const int px = (SW-pw)/2, py = (SH-ph)/2, ly = py+80;
-  if(sel>=vis)top=sel-vis+1;
-  beginScreenFx();
-  for (;;) {
-    if(!beginUiFrame()) return -1;
-    SDL_Event e;
+static int dropdown(const DropdownAnchor &anchor,const char *const *labels,int count,
+                           int current,bool localizeChoices,const SDL_Color *swatches,
+                           const std::function<void(const SDL_Rect&,int)> &preview) {
+  constexpr int itemHeight = 40;
+  constexpr int padding = 8;
+  constexpr int textInset = 20;
+  constexpr int markSpace = 28;
+  constexpr int maxVisible = 8;
+  const int screenWidth=SW, screenHeight=SH;
+  const SDL_Rect &row = anchor.row;
+  const auto label = [&](int index) { return localizeChoices?tr(labels[index]):labels[index]; };
+  int widest = 0;
+  for(int index=0;index<count;++index)
+    widest = std::max(widest,textW(g_font,label(index)));
+  const int width = std::clamp(widest + textInset * 2 + markSpace + (swatches?40:0),
+                               220,std::max(220,row.w/2));
+  const int x = std::clamp(row.x + row.w - width,8,std::max(8,SW - width - 8));
+  const int spaceBelow = SH - settingsFooterReserve() - (row.y + row.h) - 4;
+  const int spaceAbove = row.y - topBarH() - 4;
+  const int wanted = std::min(count,maxVisible) * itemHeight + 2 * padding;
+  const bool below = spaceBelow >= wanted || spaceBelow >= spaceAbove;
+  const int visible = std::clamp(((below?spaceBelow:spaceAbove)-2*padding)/itemHeight,
+                                 1,std::min(count,maxVisible));
+  const int height = visible * itemHeight + 2 * padding;
+  const int y = std::clamp(below?row.y+row.h+2:row.y-height-2,8,std::max(8,SH-height-8));
+  int selection = std::clamp(current,0,count-1);
+  int top = std::clamp(selection-visible/2,0,std::max(0,count-visible));
+
+  // The bezel preview follows the focused item in a separate pane beside the list.
+  const int previewWidth = std::clamp(x-32,0,420);
+  const int previewHeight = std::min(std::max(240,height),SH-settingsFooterReserve()-topBarH());
+  const SDL_Rect previewArea{x-previewWidth-16,
+                             std::clamp(y,topBarH(),SH-settingsFooterReserve()-previewHeight),
+                             previewWidth,previewHeight};
+
+  while(beginUiFrame()){
+    SDL_Event event;
     navRepeat();
-    while (pollUiEvent(e)) {
-      pumpStick(e);
-      { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
-        if(touchScrollList(tk,sel,top,n,vis)) continue;
-        if(tk==TOUCH_TAP && tx>=px+8 && tx<px+listWidth-8){
-          for(int r=0;r<vis&&top+r<n;r++){
-            const int y=ly+r*rowH;
-            if(ty>=y&&ty<y+rowH){
-              if(preview&&sel!=top+r){sel=top+r;break;}
-              return top+r;
-            }
-          }
-        } }
-      if (e.type != SDL_CONTROLLERBUTTONDOWN) continue;
-      switch (e.cbutton.button) {
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:   sel=(sel+n-1)%n; break;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=(sel+1)%n;   break;
-        case BTN_CONFIRM: return sel;
-        case BTN_CANCEL:  return -1;
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int touchX=0,touchY=0;
+      if(SW!=screenWidth || SH!=screenHeight) return -1;
+      const TouchKind touch = touchFeed(event,&touchX,&touchY);
+      if(touchScrollList(touch,selection,top,count,visible)) continue;
+      if(touch==TOUCH_TAP){
+        const SDL_Point touchPoint{touchX,touchY};
+        if(touchX<x || touchX>=x+width || touchY<y+padding || touchY>=y+height-padding)
+          {
+          if(preview && previewArea.w>16 && SDL_PointInRect(&touchPoint,&previewArea)) continue;
+          return -1;
+        }
+        const int item = top+(touchY-y-padding)/itemHeight;
+        if(preview && selection!=item){ selection=item; continue; }
+        return item;
       }
-      if(sel<top) top=sel;
-      if(sel>=top+vis) top=sel-vis+1;
-      if(top<0) top=0;
+      if(event.type==SDL_CONTROLLERBUTTONDOWN){
+        switch(event.cbutton.button){
+          case SDL_CONTROLLER_BUTTON_DPAD_UP: selection=(selection+count-1)%count; break;
+          case SDL_CONTROLLER_BUTTON_DPAD_DOWN: selection=(selection+1)%count; break;
+          case BTN_CONFIRM: return selection;
+          case BTN_CANCEL: return -1;
+        }
+      } else if(event.type==SDL_KEYDOWN){
+        if(event.key.keysym.sym==SDLK_RETURN) return selection;
+        if(event.key.keysym.sym==SDLK_ESCAPE) return -1;
+      }
+      if(selection<top) top=selection;
+      if(selection>=top+visible) top=selection-visible+1;
     }
-    clearUiBackground();
-    glassPanel(px,py,pw,ph);
-    drawScrollTextL(g_font_big,px+28,py+22,pw-56,title,COL_TXT);
-    fillRect(px+28,py+66,pw-56,1,(SDL_Color){255,255,255,24});
-    for(int r=0;r<vis && top+r<n;r++){
-      const int i=top+r, y=ly+r*rowH; const bool curr=(i==sel);
-      if(curr) drawRowHighlight(px+8,y,listWidth-16,rowH-4);
-      int textX=px+32;
-      const int textY=y+(rowH-fontHeight(g_font))/2;
+
+    if(SW!=screenWidth || SH!=screenHeight) return -1;
+    anchor.drawPage();
+    fillRect(0,0,SW,SH,SDL_Color{0,0,0,70});
+    if(preview && previewArea.w>16){
+      roundedPanel(previewArea.x,previewArea.y,previewArea.w,previewArea.h,
+                   COL_PANEL,COL_SEL,14,2);
+      preview({previewArea.x+8,previewArea.y+8,previewArea.w-16,previewArea.h-16},selection);
+    }
+    roundedRect(x+3,y+6,width,height,14,SDL_Color{0,0,0,110});
+    roundedPanel(x,y,width,height,COL_PANEL,COL_SEL,14,2);
+    for(int item=0;item<visible;++item){
+      const int index=top+item;
+      const int itemY=y+padding+item*itemHeight;
+      const bool selected=index==selection;
+      if(selected) roundedRect(x+6,itemY+2,width-12,itemHeight-4,8,COL_FOCUS);
+      int textX=x+textInset;
       if(swatches){
-        const int swatchSize=28;
-        const int swatchY=y+(rowH-swatchSize)/2;
-        roundedPanel(textX,swatchY,swatchSize,swatchSize,swatches[i],
-                     (SDL_Color){225,230,240,255},6);
-        textX+=swatchSize+14;
+        const int swatchSize=24;
+        roundedPanel(textX,itemY+(itemHeight-swatchSize)/2,swatchSize,swatchSize,
+                     swatches[index],SDL_Color{225,230,240,255},6);
+        textX+=40;
       }
-      const int textWidth=px+listWidth-44-textX;
-      if(curr)
-        drawScrollTextL(g_font,textX,textY,textWidth,labels[i],COL_VAL);
-      else
-        drawText(g_font,textX,textY,
-                 fittedText(g_font,labels[i],textWidth).c_str(),COL_TXT);
+      drawText(g_font,textX,itemY+(itemHeight-fontHeight(g_font))/2,
+               fittedText(g_font,label(index),width-textInset*2-markSpace-(textX-x-textInset)).c_str(),
+               selected?COL_VAL:COL_TXT);
+      if(index==current)
+        roundedRect(x+width-textInset-10,itemY+itemHeight/2-5,10,10,5,COL_SEL);
     }
-    if(n>vis){
-      const int height=vis*rowH, thumb=std::max(12,height*vis/n);
-      fillRect(px+listWidth-18,ly,3,height,COL_CARD);
-      fillRect(px+listWidth-18,ly+(height-thumb)*top/(n-vis),3,thumb,COL_SEL);
+    if(count>visible){
+      const int trackHeight=visible*itemHeight;
+      const int thumbHeight=std::max(12,trackHeight*visible/count);
+      fillRect(x+width-7,y+padding,3,trackHeight,COL_CARD);
+      fillRect(x+width-7,y+padding+(trackHeight-thumbHeight)*top/(count-visible),
+               3,thumbHeight,COL_SEL);
     }
-    if(preview)preview({px+listWidth+12,ly,pw-listWidth-36,vis*rowH},sel);
-    FootItem footer[]={{"A","Select",FA_NONE},{"B","Back",FA_NONE}};
-    drawFooterHints(footer,2,py+ph-28);
-    drawFadeIn();
     presentUi();
     waitForNextUiFrame();
   }
+  return -1;
 }
-static void optChoosePopup(const Opt &o) {
+static void optChoosePopup(const Opt &o,const DropdownAnchor &anchor) {
   if(o.type!=OT_CHOICE || o.nch<=0) return;
-  const char* labels[32];std::array<std::string,32> localized; int n = o.nch>32?32:o.nch;
-  for(int i=0;i<n;i++){localized[i]=LauncherLocalization::Translate(o.ch[i].label);labels[i]=localized[i].c_str();}
+  std::vector<const char*> labels;
+  labels.reserve(o.nch);
+  const Choice *choices=o.ch;
+  for(int i=0;i<o.nch;++i)
+    labels.push_back(choices[i].label);
   const SDL_Color *swatches=o.key&&!strcmp(o.key,"Drastic/FirmwareColor")
       ? C_firmwareColorRgb : nullptr;
-  int idx = dropdown(LauncherLocalization::Translate(o.label).data(), labels, n, choiceIdx(o), swatches);
-  if(idx>=0 && idx<o.nch) iniSet(o.key, o.ch[idx].val);
+  const int idx=dropdown(anchor,labels.data(),o.nch,choiceIdx(o),true,swatches);
+  if(idx>=0)
+    iniSet(o.key,o.ch[idx].val);
 }
 
-static void chooseCustomShader(const Opt &option) {
+static void chooseCustomShader(const Opt &option,const DropdownAnchor &anchor) {
   std::vector<CustomShaderInfo> shaders=customShaderList();
   if(shaders.empty()){
     modalMessage("No custom shaders found",
@@ -5389,8 +5486,7 @@ static void chooseCustomShader(const Opt &option) {
     if(!strcmp(shaders[index].relative.c_str(),configured)) current=(int)index;
   }
   for(const std::string &label:labelStorage) labels.push_back(label.c_str());
-  int selected=dropdown("Custom DraStic shader",labels.data(),
-                        (int)labels.size(),current);
+  int selected=dropdown(anchor,labels.data(),(int)labels.size(),current);
   if(selected<0||selected>=(int)shaders.size()) return;
   if(deko&&!shaders[selected].dekoReady){
     modalMessage("Deko3D shader pack missing",
@@ -5900,8 +5996,10 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
             editCustomLayout(pad,ctx);
             beginScreenFx();
           }
-          else if(o.type==OT_SHADER){ chooseCustomShader(o); beginScreenFx(); }
-          else if(o.type==OT_BACKGROUND){ chooseBackground(o); beginScreenFx(); }
+          else if(o.type==OT_SHADER){ chooseCustomShader(o,settingsDropdownAnchor(settingsListY()+(sel-top)*settingsRowH(),settingsRowH(),
+                [&] { renderSettings(scr,sel,top,ctx); })); }
+          else if(o.type==OT_BACKGROUND){ chooseBackground(o,settingsDropdownAnchor(settingsListY()+(sel-top)*settingsRowH(),settingsRowH(),
+                [&] { renderSettings(scr,sel,top,ctx); })); }
           else if(o.type==OT_DATETIME){ editCustomClock(o); beginScreenFx(); }
           else if(o.type==OT_TEXT){
             if(optEnabled(o)){
@@ -5931,7 +6029,8 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
             if(tok&&*tok) iniSet(o.key,tok);
             beginScreenFx();
           }
-          else if(o.type==OT_CHOICE && o.nch>2 && optEnabled(o)){ optChoosePopup(o); beginScreenFx(); }
+          else if(o.type==OT_CHOICE && o.nch>2 && optEnabled(o)){ optChoosePopup(o,settingsDropdownAnchor(settingsListY()+(sel-top)*settingsRowH(),settingsRowH(),
+                [&] { renderSettings(scr,sel,top,ctx); })); }
           else optAdjust(o,1);
           break;
         }
@@ -5948,6 +6047,7 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
       s_setSel[scr]=sel; s_setTop[scr]=top;
     }
     renderSettings(scr,sel,top,ctx);
+    presentUi();
     waitForNextUiFrame();
   }
 }
@@ -6016,6 +6116,50 @@ static void launcherSettingsScreen() {
     const int buttonX=(SW-buttonWidth)/2;
     const int buttonY=std::min(SH-buttonHeight-settingsFooterReserve()-24,
                                listY+visible*rowH+24);
+    const auto drawPage = [&] {
+      clearUiBackground();
+      drawHeader(LauncherLocalization::Translate("Launcher").data(),nullptr);
+      int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
+      // The panel hugs the rows actually shown instead of always reserving room
+      // for a full page.
+      glassPanel(colX-12,listY-10,colW+24,
+                 std::min(visible,std::max(0,listCount-top))*rowH+18);
+      const int rowInset=g_launcherPortrait?portraitRowInset():1;
+      if(sel<listCount){
+        float target=(float)(listY+(sel-top)*rowH+rowInset);
+        g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+        drawRowHighlight(colX,(int)g_hy,colW,rowH-rowInset*2);
+      }
+      for(int row=0;row<visible&&top+row<listCount;row++){
+        int index=top+row,slotY=listY+row*rowH; bool current=index==sel;
+        {
+          char value[96]; optValue(S_launcher[index],value,sizeof(value));
+          const std::string shown(LauncherLocalization::Translate(value));
+          drawSettingsRowText(LauncherLocalization::Translate(S_launcher[index].label).data(),
+                              shown.c_str(),slotY,colW,labelX,valX,
+                              current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM,false,0,optionSwitch(S_launcher[index]));
+        }
+      }
+      const bool updateSelected=sel==updateRow;
+      drawButtonPanel(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected);
+      const int updateButtonFontHeight=fontHeight(g_font);
+      drawTextC(g_font,SW/2,buttonY+(buttonHeight-updateButtonFontHeight)/2,
+                LauncherLocalization::Translate("Check for Updates").data(),
+                updateSelected?COL_VAL:COL_TXT);
+      const std::string updateStatus=launcherUpdateStatusText();
+      drawTextC(g_font_sm,SW/2,buttonY+buttonHeight+8,updateStatus.c_str(),updateSelected?COL_VAL:COL_DIM);
+      // The update button is outside the option array.
+      FootItem footer[5]={};int hintCount=0;
+      if(sel<optionCount&&canAdjustOption(S_launcher[sel]))
+        footer[hintCount++]={"Left / Right","Change",FA_NONE};
+      footer[hintCount++]={"A","Choose",FA_NONE};
+      footer[hintCount++]={"X","Help",FA_NONE};
+      if(sel<optionCount&&canResetOption(S_launcher[sel]))
+        footer[hintCount++]={"Y","Reset",FA_NONE};
+      footer[hintCount++]={"B","Back",FA_NONE};
+      drawFooterHints(footer,hintCount,SH-26);
+      drawFadeIn();
+    };
     SDL_Event event; navRepeat();
     while(pollUiEvent(event)){
       pumpStick(event);
@@ -6045,7 +6189,7 @@ static void launcherSettingsScreen() {
         if(sel==updateRow){ runUpdateScreen(); beginScreenFx(); }
         else {
           const Opt &option=S_launcher[sel];
-          if(option.type==OT_CHOICE&&option.nch>2){ optChoosePopup(option); beginScreenFx(); }
+          if(option.type==OT_CHOICE&&option.nch>2){ optChoosePopup(option,settingsDropdownAnchor(settingsListY()+(sel-top)*settingsRowH(),settingsRowH(),drawPage)); }
           else optAdjust(option,1);
           applyChange();
         }
@@ -6067,48 +6211,7 @@ static void launcherSettingsScreen() {
       }
     }
 
-    clearUiBackground();
-    drawHeader(LauncherLocalization::Translate("Launcher").data(),nullptr);
-    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
-    // The panel hugs the rows actually shown instead of always reserving room
-    // for a full page.
-    glassPanel(colX-12,listY-10,colW+24,
-               std::min(visible,std::max(0,listCount-top))*rowH+18);
-    const int rowInset=g_launcherPortrait?portraitRowInset():1;
-    if(sel<listCount){
-      float target=(float)(listY+(sel-top)*rowH+rowInset);
-      g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
-      drawRowHighlight(colX,(int)g_hy,colW,rowH-rowInset*2);
-    }
-    for(int row=0;row<visible&&top+row<listCount;row++){
-      int index=top+row,slotY=listY+row*rowH; bool current=index==sel;
-      {
-        char value[96]; optValue(S_launcher[index],value,sizeof(value));
-        const std::string shown(LauncherLocalization::Translate(value));
-        drawSettingsRowText(LauncherLocalization::Translate(S_launcher[index].label).data(),
-                            shown.c_str(),slotY,colW,labelX,valX,
-                            current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
-      }
-    }
-    const bool updateSelected=sel==updateRow;
-    drawButtonPanel(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected);
-    const int updateButtonFontHeight=fontHeight(g_font);
-    drawTextC(g_font,SW/2,buttonY+(buttonHeight-updateButtonFontHeight)/2,
-              LauncherLocalization::Translate("Check for Updates").data(),
-              updateSelected?COL_VAL:COL_TXT);
-    const std::string updateStatus=launcherUpdateStatusText();
-    drawTextC(g_font_sm,SW/2,buttonY+buttonHeight+8,updateStatus.c_str(),updateSelected?COL_VAL:COL_DIM);
-    // The update button is outside the option array.
-    FootItem footer[5]={};int hintCount=0;
-    if(sel<optionCount&&canAdjustOption(S_launcher[sel]))
-      footer[hintCount++]={"Left / Right","Change",FA_NONE};
-    footer[hintCount++]={"A","Choose",FA_NONE};
-    footer[hintCount++]={"X","Help",FA_NONE};
-    if(sel<optionCount&&canResetOption(S_launcher[sel]))
-      footer[hintCount++]={"Y","Reset",FA_NONE};
-    footer[hintCount++]={"B","Back",FA_NONE};
-    drawFooterHints(footer,hintCount,SH-26);
-    drawFadeIn(); presentUi(); waitForNextUiFrame();
+    drawPage(); presentUi(); waitForNextUiFrame();
   }
 }
 
@@ -6387,6 +6490,31 @@ static void gameSourcesScreen() {
     bool rebuild=false;
     while(!rebuild){
       if(!beginUiFrame()) return;
+      const auto drawPage = [&] {
+        clearUiBackground();
+        drawHeader(LauncherLocalization::Translate("Game folders").data(),
+                   LauncherLocalization::Translate("All folders are scanned by Drastic DS").data());
+        glassPanel(colX-12,startY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
+        for(int row=0;row<vis&&top+row<n;row++){
+          int index=top+row,slotY=startY+row*rowHeight;
+          int y=slotY+(rowHeight-fontHeight(g_font))/2; bool current=index==sel;
+          if(current) drawRowHighlight(colX,slotY,colW,rowHeight-4);
+          const std::string label=index==0?
+              std::string(LauncherLocalization::Translate("Add game folder")):sources[index-1];
+          const int width=valX-labelX;
+          // A long folder path scrolls while selected instead of being cut off.
+          if(current) drawScrollTextL(g_font,labelX,y,width,label.c_str(),COL_VAL);
+          else drawText(g_font,labelX,y,ellipsizedText(g_font,label,width).c_str(),
+                        index==0?COL_HI:COL_TXT);
+        }
+        if(n>vis){
+          const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
+          fillRect(trackX,startY,4,trackHeight,(SDL_Color){40,44,54,255});
+          const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
+          fillRect(trackX,startY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
+        }
+        drawFooterText("A  Select       B  Back");
+      };
       SDL_Event event; navRepeat();
       while(pollUiEvent(event)){
         pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
@@ -6416,7 +6544,7 @@ static void gameSourcesScreen() {
             }
           } else {
             const char *actions[]={"Change folder","Move up","Move down","Remove"};
-            int action=dropdown("Game folder",actions,4,0); size_t index=(size_t)(sel-1);
+            int action=dropdown({{colX,startY+(sel-top)*rowHeight,colW,rowHeight},drawPage},actions,4,-1,true); size_t index=(size_t)(sel-1);
             if(action==0){
               std::string selected=browseFolder(sources[index]);
               if(!selected.empty()){
@@ -6437,29 +6565,7 @@ static void gameSourcesScreen() {
         if(sel>=top+vis) top=sel-vis+1;
       }
       if(rebuild) break;
-      clearUiBackground();
-      drawHeader(LauncherLocalization::Translate("Game folders").data(),
-                 LauncherLocalization::Translate("All folders are scanned by Drastic DS").data());
-      glassPanel(colX-12,startY-10,colW+24,std::min(vis,std::max(0,n-top))*rowHeight+18);
-      for(int row=0;row<vis&&top+row<n;row++){
-        int index=top+row,slotY=startY+row*rowHeight;
-        int y=slotY+(rowHeight-fontHeight(g_font))/2; bool current=index==sel;
-        if(current) drawRowHighlight(colX,slotY,colW,rowHeight-4);
-        const std::string label=index==0?
-            std::string(LauncherLocalization::Translate("Add game folder")):sources[index-1];
-        const int width=valX-labelX;
-        // A long folder path scrolls while selected instead of being cut off.
-        if(current) drawScrollTextL(g_font,labelX,y,width,label.c_str(),COL_VAL);
-        else drawText(g_font,labelX,y,ellipsizedText(g_font,label,width).c_str(),
-                      index==0?COL_HI:COL_TXT);
-      }
-      if(n>vis){
-        const int trackX=listTrackX(colX,colW),trackHeight=vis*rowHeight;
-        fillRect(trackX,startY,4,trackHeight,(SDL_Color){40,44,54,255});
-        const int thumbHeight=std::max(16,trackHeight*vis/n),denominator=std::max(1,n-vis);
-        fillRect(trackX,startY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
-      }
-      drawFooterText("A  Select       B  Back");
+      drawPage();
       presentUi(); waitForNextUiFrame();
     }
   }
@@ -7070,7 +7176,7 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
   }
 }
 
-static void downloadCover(Game &g) {
+static void downloadCover(Game &g,const DropdownAnchor &anchor) {
   std::string key=storeGet(g_global,"Wrapper/SteamGridDBKey","");
   if(key.empty()){
     char buffer[128];
@@ -7090,7 +7196,7 @@ static void downloadCover(Game &g) {
     for(const auto &match:matches) labels.push_back(match.name);
     std::vector<const char*> names; names.reserve(labels.size());
     for(const auto &label:labels) names.push_back(label.c_str());
-    int gameIndex=dropdown(tr("Choose matching title"),names.data(),(int)names.size(),-1);
+    int gameIndex=dropdown(anchor,names.data(),(int)names.size(),-1);
     if(gameIndex<0) return;
     if(gameIndex==0){
       char custom[256];
@@ -7201,6 +7307,26 @@ static void coverSettings(Game &g){
   bool hasCustom=regularFileExists(existingCoverPath(g));
   beginScreenFx();for(;;){
     if(!beginUiFrame())return;
+    const auto drawPage = [&] {
+      clearUiBackground();drawHeader(LauncherLocalization::Translate("Cover settings").data(),g.title.c_str());
+      drawGamePreview(g,layout.preview);
+      for(int index=0;index<2;index++){
+        const SDL_Rect &card=cards[index];const bool current=index==selection;
+        // Selection is the panel's own rim, matching the artwork preview beside it.
+        if(current)roundedPanel(card.x,card.y,card.w,card.h,COL_PANEL,COL_SEL);
+        else glassPanel(card.x,card.y,card.w,card.h);
+        if(current)drawRowHighlight(card.x+8,card.y+8,card.w-16,card.h-16);
+        const int x=card.x+28,width=card.w-56;
+        drawText(g_font_sm,x,card.y+24,LauncherLocalization::Translate(kinds[index]).data(),COL_HI);
+        const std::string title(LauncherLocalization::Translate(titles[index]));
+        drawScrollTextL(g_font,x,card.y+62,width,title.c_str(),current?COL_VAL:COL_TXT);
+        drawWrapped(g_font_sm,x,card.y+112,width,fontHeight(g_font_sm)+7,
+          std::max(1,(card.h-132)/(fontHeight(g_font_sm)+7)),
+          LauncherLocalization::Translate(descriptions[index]).data(),COL_DIM);
+      }
+      if(hasCustom){FootItem footer[]={{"A","Choose",FA_NONE},{"Y","Remove custom cover",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,3,SH-26);}else{FootItem footer[]={{"A","Choose",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,SH-26);}
+      drawFadeIn();
+    };
     SDL_Event event;navRepeat();
     while(pollUiEvent(event)){pumpStick(event);int tx=0,ty=0;TouchKind touch=touchFeed(event,&tx,&ty);bool choose=false;
       if(touch==TOUCH_TAP){if(inside(cards[0],tx,ty)){selection=0;choose=true;}else if(inside(cards[1],tx,ty)){selection=1;choose=true;}else if(ty>=SH-40)return;}
@@ -7209,25 +7335,11 @@ static void coverSettings(Game &g){
         else if(event.cbutton.button==BTN_CONFIRM)choose=true;
         else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&hasCustom){removeCustom();hasCustom=regularFileExists(existingCoverPath(g));beginScreenFx();}
         else if(event.cbutton.button==BTN_CANCEL)return;}
-      if(choose){if(selection==0)downloadCover(g);else importCoverFromFile(g);hasCustom=regularFileExists(existingCoverPath(g));beginScreenFx();}}
-    clearUiBackground();drawHeader(LauncherLocalization::Translate("Cover settings").data(),g.title.c_str());
-    drawGamePreview(g,layout.preview);
-    for(int index=0;index<2;index++){
-      const SDL_Rect &card=cards[index];const bool current=index==selection;
-      // Selection is the panel's own rim, matching the artwork preview beside it.
-      if(current)roundedPanel(card.x,card.y,card.w,card.h,COL_PANEL,COL_SEL);
-      else glassPanel(card.x,card.y,card.w,card.h);
-      if(current)drawRowHighlight(card.x+8,card.y+8,card.w-16,card.h-16);
-      const int x=card.x+28,width=card.w-56;
-      drawText(g_font_sm,x,card.y+24,LauncherLocalization::Translate(kinds[index]).data(),COL_HI);
-      const std::string title(LauncherLocalization::Translate(titles[index]));
-      drawScrollTextL(g_font,x,card.y+62,width,title.c_str(),current?COL_VAL:COL_TXT);
-      drawWrapped(g_font_sm,x,card.y+112,width,fontHeight(g_font_sm)+7,
-        std::max(1,(card.h-132)/(fontHeight(g_font_sm)+7)),
-        LauncherLocalization::Translate(descriptions[index]).data(),COL_DIM);
-    }
-    if(hasCustom){FootItem footer[]={{"A","Choose",FA_NONE},{"Y","Remove custom cover",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,3,SH-26);}else{FootItem footer[]={{"A","Choose",FA_NONE},{"B","Back",FA_NONE}};drawFooterHints(footer,2,SH-26);}
-    drawFadeIn();presentUi();waitForNextUiFrame();}
+      if(choose){if(selection==0)downloadCover(g,{cards[0],drawPage});else importCoverFromFile(g);hasCustom=regularFileExists(existingCoverPath(g));beginScreenFx();}}
+    drawPage();
+    presentUi();
+    waitForNextUiFrame();
+  }
 }
 
 static void downloadAllCovers() {
@@ -7510,9 +7622,9 @@ static void drawGameMenu(Game &game,int selection){
     const SDL_Color color=index==GAME_MENU_COUNT-1?(SDL_Color){238,135,135,255}:
                           (current?COL_VAL:COL_TXT);
     drawSettingsRowText(LauncherLocalization::Translate(GAME_MENU_ITEMS[index]).data(),
-                        index==4?(g_favorites.count(game.key)?tr("Yes"):tr("No")):(submenu?">":""),layout.rowY(index),menu.w,
+                        submenu?">":"",layout.rowY(index),menu.w,
                         menu.x+24,menu.x+menu.w-24,current,color,
-                        current?COL_VAL:COL_DIM,false,layout.rowHeight);
+                        current?COL_VAL:COL_DIM,false,layout.rowHeight,index==4?rowSwitch(g_favorites.count(game.key)!=0):RowSwitch::None);
   }
   FootItem footer[]={{"A",selection==0?"Launch":"Select",FA_NONE},{"B","Back",FA_NONE}};
   drawFooterHints(footer,2,SH-26);

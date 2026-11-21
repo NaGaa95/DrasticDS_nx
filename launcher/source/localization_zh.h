@@ -37,7 +37,6 @@ constexpr ChineseEntry CHINESE_ENTRIES[]={
  {"Installing bundled custom shaders (one-time)...","正在安装内置着色器（仅一次）...","正在安裝內建著色器（僅一次）..."},
  {"USB drive ejected safely","USB 存储设备已安全弹出","USB 儲存裝置已安全退出"},
  {"%d games queued","%d 个游戏等待处理","%d 個遊戲等待處理"},
- {"Choose matching title","选择匹配的游戏","選擇相符的遊戲"},
  {"Cover download failed","封面下载失败","封面下載失敗"},
  {"Cover downloaded","封面已下载","封面已下載"},
  {"Downloading selected cover","正在下载所选封面","正在下載所選封面"},

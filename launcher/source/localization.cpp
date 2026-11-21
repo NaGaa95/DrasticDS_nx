@@ -51,7 +51,6 @@ constexpr Entry ENTRIES[]={
  {"Installing bundled custom shaders (one-time)...","Installation des shaders intégrés (une seule fois)...","Mitgelieferte Shader werden installiert (einmalig)...","Instalando los shaders incluidos (una sola vez)...","Installazione degli shader inclusi (una sola volta)...","A instalar os shaders incluídos (apenas uma vez)..."},
  {"USB drive ejected safely","Périphérique USB éjecté en toute sécurité","USB-Laufwerk sicher ausgeworfen","Unidad USB expulsada de forma segura","Unità USB espulsa correttamente","Unidade USB ejetada em segurança"},
  {"%d games queued","%d jeux en attente","%d Spiele in der Warteschlange","%d juegos en cola","%d giochi in coda","%d jogos em espera"},
- {"Choose matching title","Choisir le jeu correspondant","Passenden Titel auswählen","Elegir el título correspondiente","Scegli il titolo corrispondente","Escolher o título correspondente"},
  {"Cover download failed","Échec du téléchargement de la jaquette","Cover konnte nicht heruntergeladen werden","Error al descargar la carátula","Download della copertina non riuscito","Falha ao transferir a capa"},
  {"Cover downloaded","Jaquette téléchargée","Cover heruntergeladen","Carátula descargada","Copertina scaricata","Capa transferida"},
  {"Downloading selected cover","Téléchargement de la jaquette choisie","Ausgewähltes Cover wird heruntergeladen","Descargando la carátula elegida","Download della copertina selezionata","A transferir a capa escolhida"},
