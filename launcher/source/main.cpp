@@ -327,8 +327,16 @@ static bool regularFileExists(const std::string &path) {
   return queryRegularFile(path, exists) && exists;
 }
 
+// Checked at most once a second: the settings screens ask every frame.
 static bool lsfgDllInstalled() {
-  return regularFileExists(LSFG_DLL_FILE);
+  static bool installed=false;
+  static Uint32 checked=0;
+  const Uint32 now=SDL_GetTicks();
+  if(!checked||now-checked>=1000){
+    installed=regularFileExists(LSFG_DLL_FILE);
+    checked=now?now:1;
+  }
+  return installed;
 }
 
 static bool normalizeLsfgStore(Store &store) {
@@ -435,11 +443,8 @@ static bool migrateFastForwardProfiles() {
 }
 
 static const char *iniGet(const char *key, const char *def) {
-  if (g_active == &g_game) {
-    for (auto &e : g_game.kv)   if (e.k == key) return e.v.c_str();
-    for (auto &e : g_global.kv) if (e.k == key) return e.v.c_str();
-    return def;
-  }
+  if (g_active == &g_game)
+    return storeHas(g_game,key) ? storeGet(g_game,key,def) : storeGet(g_global,key,def);
   return storeGet(*g_active, key, def);
 }
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
@@ -7191,6 +7196,13 @@ static void downloadCover(Game &g,const DropdownAnchor &anchor) {
     std::atomic_bool cancel{false}; int result=GRIDDB_NO_NET;
     runBusyTask("Searching SteamGridDB",query,[&]{ result=griddb_search_games(key,query,matches,&cancel); },&cancel);
     if(cancel.load(std::memory_order_acquire)) return;
+    if(result==GRIDDB_NO_KEY){
+      // As in the other ports' launchers: ask for the key again, then search again.
+      char buffer[128];
+      if(!promptText("SteamGridDB API key rejected",key.c_str(),buffer,sizeof(buffer))||!*buffer) return;
+      key=buffer; storeSet(g_global,"Wrapper/SteamGridDBKey",buffer); storeSave(g_global,LAUNCHER_INI);
+      continue;
+    }
     if(result!=GRIDDB_OK&&result!=GRIDDB_NOT_FOUND){ modalMessage(uiText("Cover search failed").c_str(),{gridDbErrorText(result)}); return; }
     std::vector<std::string> labels={"Custom search..."};
     for(const auto &match:matches) labels.push_back(match.name);
