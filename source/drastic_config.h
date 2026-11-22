@@ -95,6 +95,7 @@ typedef struct {
 
 void drastic_config_load(DrasticRuntimeConfig *config);
 uint64_t drastic_config_build_core_config(void);
+uint64_t drastic_config_for_fast_forward(uint64_t config);
 const char *drastic_config_filter_name(DrasticVideoFilter filter);
 void drastic_config_calculate_layout(DrasticRuntimeConfig *config,
                                      int width, int height);

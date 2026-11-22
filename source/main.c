@@ -722,8 +722,9 @@ static int process_input(DrasticRuntimeConfig *config,
                                : combo_held(held, controls->hotkeys.fast_forward);
   if (fast_forward != controls->fast_forward) {
     controls->fast_forward = fast_forward;
-    uint64_t packed = config->core_config;
-    if (fast_forward) packed |= UINT64_C(1) << 29;
+    const uint64_t packed = fast_forward
+        ? drastic_config_for_fast_forward(config->core_config)
+        : config->core_config;
     core.applyConfig(fake_env, clazz, (jlong)packed);
   }
   if (pressed & DRASTIC_INPUT_HOTKEY_BIT(

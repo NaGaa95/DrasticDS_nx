@@ -10,6 +10,11 @@
 #include "drastic_rotation.h"
 #include "prefs.h"
 
+enum {
+  CORE_FAST_FORWARD_SPEED_SHIFT = 12,
+  CORE_FAST_FORWARD_ENABLE_BIT = 29,
+};
+
 static int clamp_int(int value, int minimum, int maximum) {
   if (value < minimum) return minimum;
   if (value > maximum) return maximum;
@@ -62,7 +67,7 @@ uint64_t drastic_config_build_core_config(void) {
   uint64_t value = (uint64_t)frameskip;
   value |= (uint64_t)frameskip_type << 5;
   value |= (uint64_t)audio_latency << 8;
-  value |= (uint64_t)fast_forward << 12;
+  value |= (uint64_t)fast_forward << CORE_FAST_FORWARD_SPEED_SHIFT;
   value |= (uint64_t)cpu_threads << 16;
   value |= (uint64_t)autofire << 32;
   value |= (uint64_t)mic_level << 37;
@@ -87,6 +92,16 @@ uint64_t drastic_config_build_core_config(void) {
   value |= flag_if(prefs_get_bool("Drastic/Blend", false), 49);
   value |= flag_if(prefs_get_bool("Drastic/RawSaveFormat", false), 50);
   return value;
+}
+
+uint64_t drastic_config_for_fast_forward(uint64_t config) {
+  const unsigned speed = (config >> CORE_FAST_FORWARD_SPEED_SHIFT) & 0xf;
+  if (speed >= 1 && speed <= 4) {
+    /* Draw on both frame parities for games that alternate LCD updates. */
+    const unsigned skipped_frames = (speed / 2) * 2;
+    config = (config & ~UINT64_C(0xf)) | skipped_frames;
+  }
+  return config | (UINT64_C(1) << CORE_FAST_FORWARD_ENABLE_BIT);
 }
 
 static DrasticLayoutMode read_layout(void) {
