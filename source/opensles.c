@@ -20,6 +20,13 @@
 #define OSL_QUEUE_CAPACITY 16
 #define OSL_WAVEBUFS 4
 #define OSL_BLOCK_CAPACITY 0x10000
+/* Length of the fades where playback runs dry and resumes (2.9 ms at 44.1 kHz). */
+#define OSL_FADE_FRAMES 128
+/* Fade the end of the queued audio once this little is left and nothing follows:
+ * one 5 ms renderer frame of polling plus the fade itself. */
+#define OSL_TAIL_FADE_MS 10
+/* After running dry, resume once this many buffers are waiting. */
+#define OSL_RESUME_PACKETS 2
 
 #define OSL_MIC_CAPTURE_BUFFERS 4
 #define OSL_MIC_CAPTURE_FRAMES 480
@@ -97,6 +104,13 @@ struct OslAudioObject {
   AudioDriverWaveBuf wavebufs[OSL_WAVEBUFS];
   unsigned wave_pending[OSL_WAVEBUFS];
   unsigned next_wave;
+  unsigned last_wave;
+  u32 queued_frames; /* frames handed to the voice, on its played-sample scale */
+  int tail_faded;
+  int fade_in_next;
+  int rebuffering;
+  Handle callback_thread;
+  volatile int callback_running;
 
   SwitchMic microphone;
   void *mic_capture_ring;
@@ -338,10 +352,44 @@ static unsigned queue_outstanding_locked(const OslAudioObject *audio) {
   return audio->packet_count + player_pending_count_locked(audio);
 }
 
+/* Linear fade over at most OSL_FADE_FRAMES frames of 16-bit PCM. */
+static void fade_pcm16(int16_t *samples, size_t frames, unsigned channels,
+                       int fade_in) {
+  if (frames > OSL_FADE_FRAMES) frames = OSL_FADE_FRAMES;
+  for (size_t frame = 0; frame < frames; frame++) {
+    const int32_t gain = fade_in ? (int32_t)(frame + 1)
+                                 : (int32_t)(frames - frame - 1);
+    for (unsigned channel = 0; channel < channels; channel++) {
+      int16_t *sample = &samples[frame * channels + channel];
+      *sample = (int16_t)((int32_t)*sample * gain / (int32_t)frames);
+    }
+  }
+}
+
+/* The playback thread shares its core with Drastic's busy worker threads.
+ * Running ahead of them gets completions to Drastic on time; a late one makes
+ * Drastic think its queue is full and discard a frame of audio. The thread
+ * sleeps between audio renderer frames. */
+static void player_raise_priority(void) {
+  s32 current;
+  u64 allowed;
+  if (R_FAILED(svcGetThreadPriority(&current, CUR_THREAD_HANDLE)) ||
+      R_FAILED(svcGetInfo(&allowed, InfoType_PriorityMask,
+                          CUR_PROCESS_HANDLE, 0)))
+    return;
+  for (s32 priority = current - 4; priority < current; priority++) {
+    if (priority >= 0 && ((allowed >> priority) & 1) &&
+        R_SUCCEEDED(svcSetThreadPriority(CUR_THREAD_HANDLE, (u32)priority)))
+      return;
+  }
+}
+
 static void *player_thread(void *argument) {
   OslAudioObject *audio = (OslAudioObject *)argument;
   pthr_ensure_fake_tls();
   pthr_pin_bg_core();
+  player_raise_priority();
+  audio->callback_thread = threadGetCurHandle();
 
   while (__atomic_load_n(&audio->running, __ATOMIC_ACQUIRE)) {
     int invoke_callback = 0;
@@ -359,8 +407,19 @@ static void *player_thread(void *argument) {
       }
     }
 
+    /* The voice ran dry. Wait for a cushion before resuming, as Drastic's own
+     * silence buffer did, and fade the restart in. */
+    if (!audio->rebuffering && audio->queued_frames &&
+        !audio->packet_count && !player_pending_count_locked(audio)) {
+      audio->rebuffering = 1;
+      audio->fade_in_next = 1;
+      audio->queued_frames =
+          audrvVoiceGetPlayedSampleCount(&audio->driver, audio->voice_id);
+    }
+
     if (!audio->suspended &&
-        audio->io_state == SL_PLAYSTATE_PLAYING && audio->packet_count) {
+        audio->io_state == SL_PLAYSTATE_PLAYING && audio->packet_count &&
+        (!audio->rebuffering || audio->packet_count >= OSL_RESUME_PACKETS)) {
       unsigned index = audio->next_wave;
       unsigned searched = 0;
       while (searched < OSL_WAVEBUFS &&
@@ -382,6 +441,8 @@ static void *player_thread(void *argument) {
         if (frame_bytes) size -= size % frame_bytes;
         void *block = (char *)audio->ring + index * OSL_BLOCK_CAPACITY;
         memcpy(block, packet.data, size);
+        if (audio->fade_in_next && audio->bits == 16 && frame_bytes)
+          fade_pcm16(block, size / frame_bytes, audio->channels, 1);
         armDCacheFlush(block, size);
 
         memset(wave, 0, sizeof(*wave));
@@ -394,6 +455,11 @@ static void *player_thread(void *argument) {
         if (audrvVoiceAddWaveBuf(&audio->driver, audio->voice_id, wave)) {
           audio->wave_pending[index] = 1;
           audio->next_wave = (index + 1) % OSL_WAVEBUFS;
+          audio->last_wave = index;
+          audio->queued_frames += (u32)(size / frame_bytes);
+          audio->tail_faded = 0;
+          audio->fade_in_next = 0;
+          audio->rebuffering = 0;
           audrvUpdate(&audio->driver);
         } else {
           audio->packet_head = (audio->packet_head + OSL_QUEUE_CAPACITY - 1) %
@@ -403,10 +469,36 @@ static void *player_thread(void *argument) {
         }
       }
     }
+
+    /* Nothing follows the queued audio and it is about to end: fade its last
+     * frames out so running dry does not click. If more audio arrives in time,
+     * it fades back in. */
+    if (!audio->tail_faded && !audio->packet_count && audio->bits == 16 &&
+        audio->wave_pending[audio->last_wave]) {
+      const u32 played =
+          audrvVoiceGetPlayedSampleCount(&audio->driver, audio->voice_id);
+      const u32 remaining = audio->queued_frames - played;
+      if (remaining <= audio->sample_rate * OSL_TAIL_FADE_MS / 1000) {
+        const AudioDriverWaveBuf *wave = &audio->wavebufs[audio->last_wave];
+        const size_t frame_bytes = audio->channels * sizeof(int16_t);
+        size_t frames = (size_t)(wave->end_sample_offset -
+                                 wave->start_sample_offset);
+        if (frames > OSL_FADE_FRAMES) frames = OSL_FADE_FRAMES;
+        int16_t *tail = (int16_t *)((char *)audio->ring +
+            (size_t)(wave->end_sample_offset - (s32)frames) * frame_bytes);
+        fade_pcm16(tail, frames, audio->channels, 0);
+        armDCacheFlush(tail, frames * frame_bytes);
+        audio->tail_faded = 1;
+        audio->fade_in_next = 1;
+      }
+    }
     mutexUnlock(&audio->lock);
 
-    if (invoke_callback)
+    if (invoke_callback) {
+      audio->callback_running = 1;
       queue_invoke_callback(audio);
+      audio->callback_running = 0;
+    }
 
     audrenWaitFrame();
   }
@@ -1035,6 +1127,12 @@ static const struct SLRecordItf_ record_vtable = {
 static SLresult queue_enqueue_common(OslAudioObject *audio, const void *buffer,
                                      SLuint32 size) {
   if (!buffer || !size) return SL_RESULT_PARAMETER_INVALID;
+  /* Drastic's completion callback queues a whole buffer of silence when the
+   * emulator has not delivered audio in time, and later counts that buffer's
+   * completion as real audio, which makes its next real buffer overflow the
+   * queue and get lost. The player rebuffers and fades by itself instead. */
+  if (audio->callback_running && threadGetCurHandle() == audio->callback_thread)
+    return SL_RESULT_SUCCESS;
   mutexLock(&audio->lock);
   const unsigned outstanding = queue_outstanding_locked(audio);
   if (outstanding >= audio->queue_capacity) {
@@ -1065,6 +1163,10 @@ static SLresult queue_clear(SLBufferQueueItf self) {
     memset(audio->wave_pending, 0, sizeof(audio->wave_pending));
     player_voice_init(audio);
   }
+  audio->queued_frames = 0;
+  audio->tail_faded = 0;
+  audio->fade_in_next = 1;
+  audio->rebuffering = 0;
   mutexUnlock(&audio->lock);
   return SL_RESULT_SUCCESS;
 }
