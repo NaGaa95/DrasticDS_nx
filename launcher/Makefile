@@ -58,7 +58,16 @@ STORAGE_LIBS := $(STORAGE_BUILD)/_deps/libsmb2-build/lib/libsmb2.a \
 LIBS	:=	$(STORAGE_LIBS) `$(PREFIX)pkg-config --libs $(PKGS)` -lturbojpeg -lz -lGLESv2 -lnx
 
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+# The launcher links stock switch-mesa 20.1.0, the EGL that devkitPro's SDL2 is built against: build_all.sh stages it
+# from the pacman cache, so a unified Mesa SDK installed over portlibs/switch never reaches the launcher.
+STAGED_MESA20 := $(TOPDIR)/../.drasticds-nx-cache/launcher_mesa20/opt/devkitpro/portlibs/switch
+ifneq ($(wildcard $(STAGED_MESA20)/lib/libGLESv2.a),)
+LAUNCHER_MESA20_ROOT ?= $(STAGED_MESA20)
+else
+LAUNCHER_MESA20_ROOT ?= $(PORTLIBS)
+endif
+
+LIBDIRS	:= $(LAUNCHER_MESA20_ROOT) $(PORTLIBS) $(LIBNX)
 
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))

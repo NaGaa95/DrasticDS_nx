@@ -243,8 +243,31 @@ make -C "$APP/launcher/fwd" clean OUT="$ROMFS_STAGE/fwd" >/dev/null
 make -C "$APP/launcher/fwd" -j"$JOBS" OUT="$ROMFS_STAGE/fwd"
 
 echo "==== SDL2 launcher ===="
+# devkitPro's SDL2 is built against stock switch-mesa 20.1.0, which a unified Mesa SDK installed over portlibs/switch
+# replaces: the launcher links the package from the pacman cache instead.
+MESA20_STAGE="$BUILD_CACHE/launcher_mesa20"
+MESA20_ROOT="$MESA20_STAGE/opt/devkitpro/portlibs/switch"
+MESA20_PACKAGE="${LAUNCHER_MESA20_PACKAGE:-}"
+if [[ -z "$MESA20_PACKAGE" ]]; then
+  shopt -s nullglob
+  mesa20_packages=(/var/cache/pacman/pkg/switch-mesa-20.1.0-*.pkg.tar.zst)
+  shopt -u nullglob
+  if ((${#mesa20_packages[@]})); then
+    MESA20_PACKAGE="${mesa20_packages[${#mesa20_packages[@]}-1]}"
+  fi
+fi
+if [[ -n "$MESA20_PACKAGE" && -f "$MESA20_PACKAGE" ]]; then
+  mkdir -p "$MESA20_STAGE"
+  tar -xf "$MESA20_PACKAGE" -C "$MESA20_STAGE"
+elif grep -q '^Version: 20\.1\.0' "$DEVKITPRO/portlibs/switch/lib/pkgconfig/glesv2.pc" 2>/dev/null; then
+  MESA20_ROOT="$DEVKITPRO/portlibs/switch"
+else
+  echo "Stock switch-mesa 20.1.0 is required for the SDL launcher." >&2
+  echo "Cache it with: dkp-pacman -Sw switch-mesa" >&2
+  exit 1
+fi
 make -C "$APP/launcher" -j"$JOBS" "${storage_include_args[@]}" \
-  ROMFS_DIR="$ROMFS_STAGE"
+  ROMFS_DIR="$ROMFS_STAGE" LAUNCHER_MESA20_ROOT="$MESA20_ROOT"
 mv -f "$APP/launcher/DrasticDS.nro" "$WORK/DrasticDS.nro"
 make -C "$APP/launcher" clean >/dev/null
 make -C "$APP/launcher/fwd" clean OUT="$ROMFS_STAGE/fwd" >/dev/null
