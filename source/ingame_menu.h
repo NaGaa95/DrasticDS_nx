@@ -14,6 +14,7 @@ typedef struct {
   void *env;
   void *clazz;
   void (*pause_system)(void *, void *, int);
+  void (*set_hinge_status)(void *, void *, DrasticJBoolean);
   DrasticJBoolean (*save_state)(void *, void *, int, DrasticJBoolean);
   DrasticJBoolean (*load_state)(void *, void *, int);
   DrasticJBoolean (*is_saving)(void *, void *);
@@ -53,6 +54,7 @@ void drastic_menu_destroy(DrasticIngameMenu *menu);
 void drastic_menu_open(DrasticIngameMenu *menu);
 void drastic_menu_close(DrasticIngameMenu *menu, bool resume_core);
 bool drastic_menu_is_open(const DrasticIngameMenu *menu);
+void drastic_menu_toggle_lid(DrasticIngameMenu *menu);
 void drastic_menu_apply_persisted_cheats(DrasticIngameMenu *menu);
 void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
                          HidAnalogStickState left,

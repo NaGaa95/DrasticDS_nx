@@ -1,5 +1,9 @@
 #include <switch.h>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,8 +17,32 @@ static DrasticOverlayFrame g_frame = {
   .width = DRASTIC_OVERLAY_WIDTH,
   .height = DRASTIC_OVERLAY_HEIGHT,
 };
-static ConsoleFont g_font;
-static int g_font_ready;
+enum { GLYPH_CACHE_SIZE = 512, GLYPH_MAX_DIMENSION = 48 };
+
+static const struct {
+  int pixels;
+  int line_height;
+  int baseline;
+} g_text_sizes[OVERLAY_TEXT_COUNT] = {
+  [OVERLAY_TEXT_SMALL] = {18, 24, 19},
+  [OVERLAY_TEXT_BODY] = {22, 28, 22},
+  [OVERLAY_TEXT_TITLE] = {32, 40, 31},
+};
+
+typedef struct {
+  uint32_t codepoint;
+  int size;
+  int advance, left, top, width, height;
+  bool valid;
+  uint8_t pixels[GLYPH_MAX_DIMENSION * GLYPH_MAX_DIMENSION];
+} OverlayGlyph;
+
+static OverlayGlyph g_glyphs[GLYPH_CACHE_SIZE];
+static FT_Library g_freetype;
+static FT_Face g_faces[PlSharedFontType_Total];
+static bool g_face_attempted[PlSharedFontType_Total];
+static ConsoleFont g_console_font;
+static bool g_font_service;
 static uint64_t g_hud_generation = UINT64_MAX;
 static int g_hud_show_fps = -1;
 static int g_hud_fps_tenth = -2;
@@ -26,18 +54,45 @@ static int clamp_int(int value, int minimum, int maximum) {
   return value;
 }
 
+static FT_Face get_shared_face(PlSharedFontType type) {
+  if (!g_freetype) return NULL;
+  if (!g_face_attempted[type]) {
+    g_face_attempted[type] = true;
+    PlFontData data;
+    if (R_SUCCEEDED(plGetSharedFontByType(&data, type)) &&
+        FT_New_Memory_Face(g_freetype, data.address, data.size, 0,
+                           &g_faces[type]) == 0 &&
+        FT_Select_Charmap(g_faces[type], FT_ENCODING_UNICODE) != 0) {
+      FT_Done_Face(g_faces[type]);
+      g_faces[type] = NULL;
+    }
+  }
+  return g_faces[type];
+}
+
 void overlay_init(int rotation) {
-  PrintConsole *console = consoleGetDefault();
-  if (console && console->font.gfx && console->font.tileWidth &&
-      console->font.tileHeight) {
-    g_font = console->font;
-    g_font_ready = 1;
+  const PrintConsole *console = consoleGetDefault();
+  if (console) g_console_font = console->font;
+  if (!g_font_service && R_SUCCEEDED(plInitialize(PlServiceType_User))) {
+    g_font_service = true;
+    if (FT_Init_FreeType(&g_freetype) == 0)
+      get_shared_face(PlSharedFontType_Standard);
   }
   g_frame.width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
                                  : DRASTIC_OVERLAY_WIDTH;
   g_frame.height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
                                   : DRASTIC_OVERLAY_HEIGHT;
   memset(g_pixels, 0, sizeof(g_pixels));
+}
+
+void overlay_shutdown(void) {
+  if (g_freetype) FT_Done_FreeType(g_freetype);
+  g_freetype = NULL;
+  if (g_font_service) plExit();
+  g_font_service = false;
+  memset(g_faces, 0, sizeof(g_faces));
+  memset(g_face_attempted, 0, sizeof(g_face_attempted));
+  memset(g_glyphs, 0, sizeof(g_glyphs));
 }
 
 void overlay_set_rotation(int rotation) {
@@ -99,14 +154,11 @@ void overlay_draw_hud(bool show_fps, float fps, bool fast_forward) {
 
   enum {
     HUD_MARGIN = 18,
-    HUD_HEIGHT = 40,
+    HUD_HEIGHT = 36,
     HUD_GAP = 8,
-    HUD_FPS_WIDTH = 168,
-    HUD_FAST_FORWARD_WIDTH = 272,
   };
-  const uint32_t background = 0xf018202cu;
-  const uint32_t border = 0xff2bc3d9u;
-  const uint32_t text = 0xfff1f5f9u;
+  const uint32_t background = 0xf20c1422u;
+  const uint32_t text = 0xfff2f7fbu;
   const int right = g_frame.width - HUD_MARGIN;
   int top = HUD_MARGIN;
 
@@ -114,23 +166,24 @@ void overlay_draw_hud(bool show_fps, float fps, bool fast_forward) {
   if (show_fps) {
     char label[32];
     if (fps_tenth < 0)
-      snprintf(label, sizeof(label), "FPS  --.-");
+      snprintf(label, sizeof(label), "FPS --.-");
     else
-      snprintf(label, sizeof(label), "FPS %3d.%d",
+      snprintf(label, sizeof(label), "FPS %d.%d",
                fps_tenth / 10, fps_tenth % 10);
-    const int left = right - HUD_FPS_WIDTH;
-    overlay_fill_rect(left, top, HUD_FPS_WIDTH, HUD_HEIGHT, background);
-    overlay_border_rect(left, top, HUD_FPS_WIDTH, HUD_HEIGHT, 2, border);
-    overlay_draw_text(left + 16, top + 12, text, label);
+    const int width = 36 + overlay_text_width(OVERLAY_TEXT_SMALL, "FPS 999.9");
+    overlay_fill_round_rect(right - width, top, width, HUD_HEIGHT, 10,
+                            background);
+    overlay_draw_text(right - width + 16, top + 6, OVERLAY_TEXT_SMALL,
+                      text, label);
     top += HUD_HEIGHT + HUD_GAP;
   }
   if (fast_forward) {
-    const int left = right - HUD_FAST_FORWARD_WIDTH;
-    overlay_fill_rect(left, top, HUD_FAST_FORWARD_WIDTH, HUD_HEIGHT,
-                      background);
-    overlay_border_rect(left, top, HUD_FAST_FORWARD_WIDTH, HUD_HEIGHT, 2,
-                        border);
-    overlay_draw_text(left + 16, top + 12, text, ">> FAST FORWARD");
+    const char *label = "Fast forward";
+    const int width = 32 + overlay_text_width(OVERLAY_TEXT_SMALL, label);
+    overlay_fill_round_rect(right - width, top, width, HUD_HEIGHT, 10,
+                            background);
+    overlay_draw_text(right - width + 16, top + 6, OVERLAY_TEXT_SMALL,
+                      text, label);
   }
   overlay_finish();
   g_hud_show_fps = show_fps;
@@ -163,16 +216,47 @@ static uint32_t composite_argb(uint32_t destination, uint32_t source) {
   return output;
 }
 
+static uint32_t with_coverage(uint32_t color, unsigned coverage) {
+  const unsigned alpha = ((color >> 24) * coverage + 127) / 255;
+  return (color & 0x00ffffffu) | (alpha << 24);
+}
+
 void overlay_fill_rect(int x, int y, int width, int height, uint32_t color) {
-  if (width <= 0 || height <= 0) return;
+  if (width <= 0 || height <= 0 || !(color >> 24)) return;
   const int left = clamp_int(x, 0, g_frame.width);
   const int top = clamp_int(y, 0, g_frame.height);
   const int right = clamp_int(x + width, 0, g_frame.width);
   const int bottom = clamp_int(y + height, 0, g_frame.height);
+  const bool opaque = (color >> 24) == 255;
   for (int row = top; row < bottom; row++) {
     uint32_t *destination = g_pixels + (size_t)row * g_frame.width;
-    for (int column = left; column < right; column++)
-      destination[column] = composite_argb(destination[column], color);
+    if (opaque) {
+      for (int column = left; column < right; column++)
+        destination[column] = color;
+    } else {
+      for (int column = left; column < right; column++)
+        destination[column] = composite_argb(destination[column], color);
+    }
+  }
+}
+
+void overlay_fill_round_rect(int x, int y, int width, int height, int radius,
+                             uint32_t color) {
+  if (width <= 0 || height <= 0) return;
+  radius = clamp_int(radius, 0, (width < height ? width : height) / 2);
+  overlay_fill_rect(x, y + radius, width, height - 2 * radius, color);
+  for (int row = 0; row < radius; row++) {
+    const float dy = radius - row - 0.5f;
+    const float inset = radius - sqrtf((float)(radius * radius) - dy * dy);
+    const int edge = (int)ceilf(inset);
+    const uint32_t edge_color =
+        with_coverage(color, (unsigned)((edge - inset) * 255.0f));
+    const int lines[] = {y + row, y + height - row - 1};
+    for (int i = 0; i < 2; ++i) {
+      overlay_fill_rect(x + edge, lines[i], width - 2 * edge, 1, color);
+      overlay_fill_rect(x + edge - 1, lines[i], 1, 1, edge_color);
+      overlay_fill_rect(x + width - edge, lines[i], 1, 1, edge_color);
+    }
   }
 }
 
@@ -185,213 +269,268 @@ void overlay_border_rect(int x, int y, int width, int height, int thickness,
   overlay_fill_rect(x + width - thickness, y, thickness, height, color);
 }
 
-static int glyph_set(unsigned character, int source_x, int source_y) {
-  if (!g_font_ready || character < g_font.asciiOffset ||
-      character >= (unsigned)g_font.asciiOffset + g_font.numChars)
-    return 0;
-  const unsigned glyph = character - g_font.asciiOffset;
-  const unsigned bytes_per_row = (g_font.tileWidth + 7) / 8;
-  const uint8_t *tile = (const uint8_t *)g_font.gfx +
-      (size_t)glyph * g_font.tileHeight * bytes_per_row;
-  /* Each row is a little-endian integer, but libnx maps its most-significant
-   * bit to the glyph's left edge. Keep rows top-to-bottom and reverse only the
-   * bit index within the row. */
-  const uint8_t *row = tile + (size_t)source_y * bytes_per_row;
-  const unsigned stored_bit = (unsigned)g_font.tileWidth - 1u -
-                              (unsigned)source_x;
-  return (row[stored_bit / 8] & (uint8_t)(1u << (stored_bit & 7))) != 0;
+static uint32_t read_codepoint(const char **text) {
+  const uint8_t *cursor = (const uint8_t *)*text;
+  const uint8_t first = *cursor++;
+  *text = (const char *)cursor;
+  if (first < 0x80) return first;
+  if (first < 0xc2 || first > 0xf4) return 0xfffd;
+
+  uint32_t codepoint;
+  int remaining;
+  uint32_t minimum;
+  if (first < 0xe0) {
+    codepoint = first & 0x1f;
+    remaining = 1;
+    minimum = 0x80;
+  } else if (first < 0xf0) {
+    codepoint = first & 0x0f;
+    remaining = 2;
+    minimum = 0x800;
+  } else {
+    codepoint = first & 0x07;
+    remaining = 3;
+    minimum = 0x10000;
+  }
+
+  for (int i = 0; i < remaining; ++i) {
+    if ((*cursor & 0xc0) != 0x80) return 0xfffd;
+    codepoint = (codepoint << 6) | (*cursor++ & 0x3f);
+    *text = (const char *)cursor;
+  }
+  if (codepoint < minimum || codepoint > 0x10ffff ||
+      (codepoint >= 0xd800 && codepoint <= 0xdfff))
+    return 0xfffd;
+  return codepoint;
 }
 
-static void draw_character(int x, int y, int scale, uint32_t color,
-                           unsigned character) {
-  if (!g_font_ready || scale <= 0) return;
-  if (character > 255) character = '?';
-  for (int source_y = 0; source_y < g_font.tileHeight; source_y++) {
-    for (int source_x = 0; source_x < g_font.tileWidth; source_x++) {
-      if (!glyph_set(character, source_x, source_y)) continue;
-      overlay_fill_rect(x + source_x * scale, y + source_y * scale,
-                        scale, scale, color);
+static bool load_outline_glyph(OverlayGlyph *glyph, FT_Face face,
+                               DrasticOverlayTextSize size, uint32_t codepoint) {
+  if (!face) return false;
+  const FT_UInt index = FT_Get_Char_Index(face, codepoint);
+  if (!index || FT_Set_Pixel_Sizes(face, 0, g_text_sizes[size].pixels) ||
+      FT_Load_Glyph(face, index, FT_LOAD_RENDER | FT_LOAD_NO_BITMAP))
+    return false;
+
+  const FT_GlyphSlot slot = face->glyph;
+  const FT_Bitmap *bitmap = &slot->bitmap;
+  if (bitmap->width > GLYPH_MAX_DIMENSION ||
+      bitmap->rows > GLYPH_MAX_DIMENSION ||
+      (bitmap->width && bitmap->pixel_mode != FT_PIXEL_MODE_GRAY))
+    return false;
+  glyph->advance = (int)((slot->advance.x + 32) / 64);
+  glyph->left = slot->bitmap_left;
+  glyph->top = slot->bitmap_top;
+  glyph->width = (int)bitmap->width;
+  glyph->height = (int)bitmap->rows;
+  const int pitch = bitmap->pitch;
+  const uint8_t *row = bitmap->buffer;
+  if (pitch < 0 && glyph->height > 0)
+    row += (size_t)(glyph->height - 1) * (size_t)-pitch;
+  for (int i = 0; i < glyph->height; ++i)
+    memcpy(glyph->pixels + (size_t)i * glyph->width,
+           row + (ptrdiff_t)i * pitch, glyph->width);
+  return true;
+}
+
+static void load_console_glyph(OverlayGlyph *glyph, DrasticOverlayTextSize size,
+                               uint32_t codepoint) {
+  const ConsoleFont *font = &g_console_font;
+  const int scale = size == OVERLAY_TEXT_TITLE ? 2 : 1;
+  glyph->advance = font->tileWidth ? (int)font->tileWidth * scale : 8 * scale;
+  if (!font->gfx || !font->tileWidth || !font->tileHeight ||
+      font->tileWidth * scale > GLYPH_MAX_DIMENSION ||
+      font->tileHeight * scale > GLYPH_MAX_DIMENSION)
+    return;
+
+  const uint32_t first = font->asciiOffset;
+  const uint32_t end = first + font->numChars;
+  if (codepoint < first || codepoint >= end) codepoint = '?';
+  if (codepoint < first || codepoint >= end) return;
+
+  const unsigned stride = (font->tileWidth + 7) / 8;
+  const uint8_t *tile = (const uint8_t *)font->gfx +
+      (size_t)(codepoint - first) * font->tileHeight * stride;
+  glyph->width = font->tileWidth * scale;
+  glyph->height = font->tileHeight * scale;
+  glyph->top = g_text_sizes[size].baseline -
+      (g_text_sizes[size].line_height - glyph->height) / 2;
+  for (int row = 0; row < glyph->height; ++row) {
+    for (int column = 0; column < glyph->width; ++column) {
+      const unsigned bit = (unsigned)font->tileWidth - 1 - (column / scale);
+      glyph->pixels[(size_t)row * glyph->width + column] =
+          (tile[(size_t)(row / scale) * stride + bit / 8] &
+           (1u << (bit & 7))) ? 255 : 0;
     }
   }
 }
 
-void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
-                              const char *text) {
-  if (!text || !g_font_ready || scale <= 0) return;
-  const int origin = x;
-  for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
-       cursor++) {
-    if (*cursor == '\n') {
-      x = origin;
-      y += g_font.tileHeight * scale;
-      continue;
+static const OverlayGlyph *get_glyph(DrasticOverlayTextSize size,
+                                    uint32_t codepoint) {
+  const uint32_t hash = codepoint * 2654435761u + size * 67u;
+  OverlayGlyph *glyph = &g_glyphs[hash % GLYPH_CACHE_SIZE];
+  if (glyph->valid && glyph->codepoint == codepoint && glyph->size == (int)size)
+    return glyph;
+
+  glyph->codepoint = codepoint;
+  glyph->size = size;
+  glyph->valid = true;
+  glyph->advance = glyph->left = glyph->top = glyph->width = glyph->height = 0;
+  const FT_Face standard = get_shared_face(PlSharedFontType_Standard);
+  if (load_outline_glyph(glyph, standard, size, codepoint)) return glyph;
+  if (g_freetype && codepoint >= 0x80 && codepoint != 0xfffd) {
+    for (int type = PlSharedFontType_ChineseSimplified;
+         type <= PlSharedFontType_KO; ++type)
+      if (load_outline_glyph(glyph, get_shared_face(type), size, codepoint))
+        return glyph;
+  }
+  if (load_outline_glyph(glyph, standard, size, '?')) return glyph;
+  load_console_glyph(glyph, size, codepoint);
+  return glyph;
+}
+
+int overlay_text_height(DrasticOverlayTextSize size) {
+  return g_text_sizes[size].line_height;
+}
+
+int overlay_text_width(DrasticOverlayTextSize size, const char *text) {
+  int width = 0;
+  if (!text) return width;
+  while (*text && *text != '\n' && *text != '\r')
+    width += get_glyph(size, read_codepoint(&text))->advance;
+  return width;
+}
+
+static void draw_glyph(int x, int baseline, const OverlayGlyph *glyph,
+                       int clip_left, int clip_right, uint32_t color) {
+  x += glyph->left;
+  const int y = baseline - glyph->top;
+  const int left = clamp_int(x, clip_left, clip_right);
+  const int right = clamp_int(x + glyph->width, clip_left, clip_right);
+  const int top = clamp_int(y, 0, g_frame.height);
+  const int bottom = clamp_int(y + glyph->height, 0, g_frame.height);
+  for (int row = top; row < bottom; ++row) {
+    uint32_t *destination = g_pixels + (size_t)row * g_frame.width;
+    const uint8_t *source =
+        glyph->pixels + (size_t)(row - y) * glyph->width;
+    for (int column = left; column < right; ++column) {
+      const unsigned coverage = source[column - x];
+      if (coverage)
+        destination[column] =
+            composite_argb(destination[column], with_coverage(color, coverage));
     }
-    unsigned character = *cursor;
-    if (character >= 0x80) {
-      character = '?';
-      while ((cursor[1] & 0xc0) == 0x80) cursor++;
-    }
-    draw_character(x, y, scale, color, character);
-    x += g_font.tileWidth * scale;
   }
 }
 
-void overlay_draw_text(int x, int y, uint32_t color, const char *text) {
-  overlay_draw_text_scaled(x, y, 1, color, text);
+static int draw_text_range(int x, int y, int left, int right,
+                           DrasticOverlayTextSize size, uint32_t color,
+                           const char *text, const char *end) {
+  left = clamp_int(left, 0, g_frame.width);
+  right = clamp_int(right, left, g_frame.width);
+  const int baseline = y + g_text_sizes[size].baseline;
+  while (*text && *text != '\n' && *text != '\r' && (!end || text < end) &&
+         x < right) {
+    const OverlayGlyph *glyph = get_glyph(size, read_codepoint(&text));
+    draw_glyph(x, baseline, glyph, left, right, color);
+    x += glyph->advance;
+  }
+  return x;
 }
 
-void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
+void overlay_draw_text(int x, int y, DrasticOverlayTextSize size,
+                       uint32_t color, const char *text) {
+  if (text) draw_text_range(x, y, 0, g_frame.width, size, color, text, NULL);
+}
+
+void overlay_draw_text_clipped(int x, int y, int max_width,
+                               DrasticOverlayTextSize size, uint32_t color,
                                const char *text) {
-  if (!text || max_width <= 0 || !g_font_ready) return;
-  const int cells = max_width / g_font.tileWidth;
-  if (cells <= 0) return;
-  char buffer[192];
-  int used = 0;
-  const unsigned char *cursor = (const unsigned char *)text;
-  while (*cursor && used < cells && used < (int)sizeof(buffer) - 1) {
-    if (*cursor < 0x80) {
-      buffer[used++] = (char)*cursor++;
-    } else {
-      buffer[used++] = '?';
-      cursor++;
-      while ((*cursor & 0xc0) == 0x80) cursor++;
-    }
+  if (!text || max_width <= 0) return;
+  const int right = x + max_width;
+  if (overlay_text_width(size, text) <= max_width) {
+    draw_text_range(x, y, x, right, size, color, text, NULL);
+    return;
   }
-  if (*cursor && cells >= 3) {
-    used = cells < (int)sizeof(buffer) ? cells : (int)sizeof(buffer) - 1;
-    buffer[used - 3] = '.';
-    buffer[used - 2] = '.';
-    buffer[used - 1] = '.';
+
+  const int dots_width = overlay_text_width(size, "...");
+  if (dots_width >= max_width) {
+    draw_text_range(x, y, x, right, size, color, text, NULL);
+    return;
   }
-  buffer[used] = '\0';
-  overlay_draw_text(x, y, color, buffer);
-}
-
-static int text_character_count(const char *text) {
-  int characters = 0;
-  if (!text) return 0;
-  for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
-       cursor++)
-    if ((*cursor & 0xc0) != 0x80) characters++;
-  return characters;
-}
-
-static uint64_t overlay_time_ms(void) {
-  const uint64_t frequency = armGetSystemTickFreq();
-  const uint64_t ticks = armGetSystemTick();
-  if (!frequency) return 0;
-  return (ticks / frequency) * 1000u +
-         ((ticks % frequency) * 1000u) / frequency;
+  const char *end = text;
+  int available = max_width - dots_width;
+  while (*end && *end != '\n' && *end != '\r') {
+    const char *next = end;
+    const int advance = get_glyph(size, read_codepoint(&next))->advance;
+    if (advance > available) break;
+    available -= advance;
+    end = next;
+  }
+  const int pen = draw_text_range(x, y, x, right, size, color, text, end);
+  draw_text_range(pen, y, x, right, size, color, "...", NULL);
 }
 
 static int marquee_offset(int overflow) {
-  if (overflow <= 0) return 0;
-  const uint64_t pause_ms = 800;
-  const uint64_t travel_ms = 3600;
-  const uint64_t cycle_ms = pause_ms * 2 + travel_ms * 2;
-  const uint64_t phase = overlay_time_ms() % cycle_ms;
-  if (phase < pause_ms) return 0;
-  if (phase < pause_ms + travel_ms)
-    return (int)(((phase - pause_ms) * (uint64_t)overflow) / travel_ms);
-  if (phase < pause_ms * 2 + travel_ms) return overflow;
-  return overflow - (int)(((phase - pause_ms * 2 - travel_ms) *
-                            (uint64_t)overflow) / travel_ms);
-}
-
-static void draw_character_clipped(int x, int y, uint32_t color,
-                                   unsigned character, int clip_left,
-                                   int clip_right) {
-  if (!g_font_ready || x >= clip_right || x + g_font.tileWidth <= clip_left)
-    return;
-  if (character > 255) character = '?';
-  for (int source_y = 0; source_y < g_font.tileHeight; source_y++) {
-    for (int source_x = 0; source_x < g_font.tileWidth; source_x++) {
-      const int destination_x = x + source_x;
-      if (destination_x < clip_left || destination_x >= clip_right ||
-          !glyph_set(character, source_x, source_y))
-        continue;
-      overlay_fill_rect(destination_x, y + source_y, 1, 1, color);
-    }
-  }
+  const uint64_t frequency = armGetSystemTickFreq();
+  if (overflow <= 0 || !frequency) return 0;
+  const uint64_t ticks = armGetSystemTick();
+  const uint64_t milliseconds = (ticks / frequency) * 1000u +
+      ((ticks % frequency) * 1000u) / frequency;
+  const uint64_t pause = 800;
+  const uint64_t travel = 3600;
+  const uint64_t phase = milliseconds % (2 * (pause + travel));
+  if (phase < pause) return 0;
+  if (phase < pause + travel)
+    return (int)((phase - pause) * (uint64_t)overflow / travel);
+  if (phase < 2 * pause + travel) return overflow;
+  return overflow - (int)((phase - 2 * pause - travel) *
+                           (uint64_t)overflow / travel);
 }
 
 void overlay_draw_text_scrolling(int x, int y, int max_width,
-                                 uint32_t color, const char *text) {
-  if (!text || !*text || max_width <= 0 || !g_font_ready) return;
-  const int text_width = text_character_count(text) * g_font.tileWidth;
-  if (text_width <= max_width) {
-    overlay_draw_text(x, y, color, text);
-    return;
-  }
-
-  int pen_x = x - marquee_offset(text_width - max_width);
-  const int clip_right = x + max_width;
-  for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
-       cursor++) {
-    unsigned character = *cursor;
-    if (character >= 0x80) {
-      character = '?';
-      while ((cursor[1] & 0xc0) == 0x80) cursor++;
-    }
-    draw_character_clipped(pen_x, y, color, character, x, clip_right);
-    pen_x += g_font.tileWidth;
-    if (pen_x >= clip_right) break;
-  }
+                                 DrasticOverlayTextSize size, uint32_t color,
+                                 const char *text) {
+  if (!text || max_width <= 0) return;
+  const int offset = marquee_offset(overlay_text_width(size, text) - max_width);
+  draw_text_range(x - offset, y, x, x + max_width, size, color, text, NULL);
 }
 
-void overlay_draw_text_scrolling_right(int right, int y, int max_width,
-                                       uint32_t color, const char *text) {
-  if (!text || !*text || max_width <= 0 || !g_font_ready) return;
-  const int text_width = text_character_count(text) * g_font.tileWidth;
-  if (text_width <= max_width) {
-    overlay_draw_text(right - text_width, y, color, text);
-    return;
-  }
-  overlay_draw_text_scrolling(right - max_width, y, max_width, color, text);
-}
-
-void overlay_draw_text_right(int right, int y, uint32_t color,
-                             const char *text) {
-  if (!text || !g_font_ready) return;
-  overlay_draw_text(right - text_character_count(text) * g_font.tileWidth,
-                    y, color, text);
+void overlay_draw_text_right(int right, int y, DrasticOverlayTextSize size,
+                             uint32_t color, const char *text) {
+  overlay_draw_text(right - overlay_text_width(size, text), y, size, color, text);
 }
 
 void overlay_draw_wrapped(int x, int y, int max_width, int max_lines,
-                          uint32_t color, const char *text) {
-  if (!text || !g_font_ready || max_lines <= 0) return;
-  const int columns = max_width / g_font.tileWidth;
-  if (columns < 2) return;
-  char line[192];
-  const char *cursor = text;
-  for (int row = 0; row < max_lines && *cursor; row++) {
-    while (*cursor == ' ' || *cursor == '\n' || *cursor == '\r') cursor++;
-    int used = 0;
-    int last_space = -1;
-    const char *line_start = cursor;
-    const char *next = cursor;
-    while (*next && *next != '\n' && used < columns &&
-           used < (int)sizeof(line) - 1) {
-      unsigned char c = (unsigned char)*next;
-      if (c == ' ') last_space = used;
-      line[used++] = c < 0x80 ? (char)c : '?';
-      next++;
-      while (((unsigned char)*next & 0xc0) == 0x80) next++;
+                          DrasticOverlayTextSize size, uint32_t color,
+                          const char *text) {
+  if (!text || max_width <= 0) return;
+  for (int line = 0; line < max_lines; ++line) {
+    while (*text == ' ' || *text == '\n' || *text == '\r' || *text == '\t')
+      ++text;
+    if (!*text) break;
+    if (line == max_lines - 1) {
+      overlay_draw_text_clipped(x, y, max_width, size, color, text);
+      break;
     }
-    if (*next && *next != '\n' && used >= columns && last_space > 0) {
-      used = last_space;
-      next = line_start;
-      int cells = 0;
-      while (*next && cells < used) {
-        next++;
-        while (((unsigned char)*next & 0xc0) == 0x80) next++;
-        cells++;
+
+    int width = 0;
+    const char *end = text;
+    const char *space = NULL;
+    while (*end && *end != '\n' && *end != '\r') {
+      const char *next = end;
+      const int advance = get_glyph(size, read_codepoint(&next))->advance;
+      if (width + advance > max_width) {
+        if (space) end = space;
+        else if (end == text) end = next;
+        break;
       }
+      if (*end == ' ') space = end;
+      end = next;
+      width += advance;
     }
-    while (used > 0 && line[used - 1] == ' ') used--;
-    line[used] = '\0';
-    overlay_draw_text(x, y + row * g_font.tileHeight, color, line);
-    cursor = next;
+    draw_text_range(x, y, x, x + max_width, size, color, text, end);
+    text = end;
+    y += overlay_text_height(size);
   }
 }
 

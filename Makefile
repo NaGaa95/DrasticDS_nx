@@ -86,7 +86,7 @@ LIBS	:= -Wl,-u,vk_icdGetInstanceProcAddr \
 		-l:libGLESv2.a -l:libEGL.a -l:libvulkan.a -l:libglapi.a \
 		-l:libmesa_util_c11.a -l:libblake3.a -l:libmesa_util.a \
 		-l:libmesa_util_simd.a -l:libxmlconfig.a \
-		`$(PREFIX)pkg-config --libs SDL2_image` \
+		`$(PREFIX)pkg-config --libs SDL2_image freetype2` \
 		-lelf -lexpat -lzstd -lz -ldeko3d -lnx -lstdc++ -lm \
 		-Wl,--end-group
 
@@ -120,6 +120,7 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(call absolute_or_local,$(dir))) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
 			-I$(LIBSMB2_INCLUDE) -I$(LIBUSBHSFS_INCLUDE) \
+			-I$(PORTLIBS)/include/freetype2 \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)

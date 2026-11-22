@@ -499,7 +499,6 @@ typedef struct {
   int fast_forward_latched;
   int fast_forward_toggle;
   int microphone_feed;
-  int hinge_closed;
   int exit_requested;
   int state_slot;
   int stylus_speed;
@@ -740,10 +739,8 @@ static int process_input(DrasticRuntimeConfig *config,
     controls->microphone_feed = microphone_feed;
     core.setWhitenoiseFeed(fake_env, clazz, microphone_feed != 0);
   }
-  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_LID)) {
-    controls->hinge_closed ^= 1;
-    core.setHingeStatus(fake_env, clazz, controls->hinge_closed != 0);
-  }
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_LID))
+    drastic_menu_toggle_lid(menu);
 
   if (config->lua_enabled && core.luaUpdateAxisValues)
     core.luaUpdateAxisValues(fake_env, clazz,
@@ -993,6 +990,7 @@ int main(void) {
     .env = fake_env,
     .clazz = clazz,
     .pause_system = core.pauseSystem,
+    .set_hinge_status = core.setHingeStatus,
     .save_state = core.saveState,
     .load_state = core.loadState,
     .is_saving = core.isSaving,
@@ -1166,6 +1164,7 @@ int main(void) {
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
   drastic_menu_destroy(menu);
+  overlay_shutdown();
   drastic_renderer_detach_core();
   shutdown_core(clazz, &game);
   /* Stop DraStic-owned Android service workers while their code and any EGL
